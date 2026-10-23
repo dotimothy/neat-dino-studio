@@ -44,7 +44,7 @@ image tokens. So the network is cut into MLA programs, and the board's Arm cores
 | On the MLA (bf16, one ELF each) | On the A65 cores |
 |---|---|
 | Text encoder (BERT + projection), once per prompt | Tokenizing, phrase masks, text position embedding |
-| Swin-B as 27 programs (24 blocks + level projections) | Moving Swin tokens between plain and shifted windows, patch merging |
+| Swin-B as 9 programs (fused stages, window shifts inside) | Swin patch merging and the return to image order (6 gathers) |
 | 7 encoder programs (fusion, text enhancer, deformable projections) | Deformable-attention sampling (NEON, 16 threads) |
 | Decoder value maps + 12 decoder programs | Top-900 selection, reference-box updates, sine embeddings |
 
@@ -54,7 +54,7 @@ app (`webapp/server.py`) talks to it as a child process; unloading a model stops
 
 | | Fast · 576 px | Accurate · 768 px |
 |---|---|---|
-| Per new image (board) | 0.36 s | 0.60 s |
+| Per new image (board) | 0.33 s | 0.54 s |
 | Prompt change, same image | 0.25 s | 0.41 s |
 | COCO AP, board (500-image val subset) | 42.0 | 46.4 |
 | COCO AP, FP32 PyTorch, same inputs | 41.7 | 45.8 |

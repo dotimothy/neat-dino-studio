@@ -8,8 +8,8 @@ sima-frontend 2.1.3), 2026-10-22/23.
 
 | | Fast · 576 px | Accurate · 768 px |
 |---|---|---|
-| MLA programs (bf16, 1 ELF each) | 48 (+ text encoder, shared) | 48 (+ text encoder, shared) |
-| Per new image, board | **~0.36 s** | **~0.60 s** |
+| MLA programs (bf16, 1 ELF each) | 29 + shared text encoder | 29 + shared text encoder |
+| Per new image, board | **~0.33 s** | **~0.54 s** |
 | COCO AP50 / APsmall, board | 65.5 / 18.4 | 69.8 / 26.3 |
 | Prompt change on the same image | ~0.25 s | ~0.41 s |
 | Prompt (text encoder) | 4.7 ms | 4.7 ms |
@@ -22,9 +22,10 @@ again with IoU ≥ 0.97 and a score within ±0.05, and COCO AP is the same withi
 (Grounding DINO's published COCO zero-shot numbers use 800×1333 inputs; these use a square
 letterbox and the subset, so compare the board and GPU columns, not the paper.)
 
-Time per image at 576 (ms, board): backbone 90 MLA + 25 CPU; encoder 75 MLA + 112 CPU;
-decoder values 2; top-k 4; decoder 19 MLA + 28 CPU; patchify 2. At 768: backbone 140 + 45,
-encoder 145 + 202, decoder 25 + 30.
+Time per image at 576 (ms, board): backbone 75 MLA + 7 CPU; encoder 75 MLA + 112 CPU;
+decoder values 2; top-k 4; decoder 19 MLA + 28 CPU; patchify 2. At 768: backbone 112 + 12,
+encoder 145 + 202, decoder 18 + 30. (Before the Swin stages were fused: backbone 90 + 25 and
+140 + 45, 0.36 / 0.60 s per image.)
 
 ## Why it is cut into 48 programs
 
@@ -39,9 +40,11 @@ encoder 145 + 202, decoder 25 + 30.
 3. **Decoder box refinement** needs logit/sigmoid/sine of the boxes each layer: CPU, in FP32.
 4. **Swin-B windows.** Window partitioning needs a 6-D reshape the MLA can't place; a 4-D
    reshape chain is placed but sends the compiler into "large tensor" mode that never finishes.
-   So every Swin block is its own program on tokens already in window layout, and the CPU
-   moves tokens between the plain and shifted layouts (and does patch merging) — 26 gathers,
-   25 ms at 576.
+   So the tokens stay in window layout: each Swin stage (stage 3 in three groups of six blocks)
+   is one program, and the move between plain and shifted windows is Slice+Concat inside it
+   (free on the MLA). Patch merging and the return to image order are 6 CPU gathers (7 ms at
+   576): done on the MLA with step-2 slices and a spatial reshape they compile and pass the
+   compiler's check, but compute wrong values on the board.
 
 Everything crosses between MLA and CPU in place: `dino_rt` runs bare ELFs (compiled with
 MLA tessellation, plain HWC bf16 I/O) through SimaLMM's `MLAModelWithBuffer`. Through pyneat
