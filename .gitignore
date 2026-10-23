@@ -7,3 +7,4 @@ __pycache__/
 webapp/certs/
 webapp/uploads/
 .models-dir
+.venv-sam3/
