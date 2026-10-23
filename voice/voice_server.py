@@ -51,6 +51,14 @@ def main() -> int:
         pass
     print("VOICE stopping", flush=True)
     server.stop()
+    # stop() only ends serving: the models stay allocated in the MLA service, and a process
+    # that exits with them loaded leaves that memory allocated (about 15 GB for Whisper + Gemma).
+    for name in list(server.model_names()):
+        server.remove_model(name)
+    del server
+    import gc
+    gc.collect()
+    print("VOICE stopped", flush=True)
     return 0
 
 
