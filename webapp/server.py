@@ -1,0 +1,818 @@
+#!/usr/bin/env python3
+"""Neat DINO Studio: open-vocabulary detection with Grounding DINO on the Modalix MLA.
+
+Upload a photo or use the webcam, type what to find ("person . red car . dog ."),
+and Grounding DINO boxes it. On the board the model runs as compiled MLA stages
+under dino_rt (runtime/), with deformable-attention sampling on the CPU.
+
+    python3 webapp/server.py [--port 8092] [--model dino-576-bf16] [--backend mla|torch|fake]
+
+Models live in the shared models directory (DINO_MODELS_DIR, .models-dir, or
+/media/nvme/models/dino) and are downloaded from Hugging Face in Settings -> Models.
+Only the model manager loads and unloads: one detector on the MLA at a time.
+"""
+from __future__ import annotations
+
+import argparse
+import faulthandler
+import hashlib
+import io
+import json
+import mimetypes
+import os
+import re
+import shutil
+import signal
+import socket
+import ssl
+import subprocess
+import sys
+import tarfile
+import threading
+import time
+import traceback
+import urllib.request
+from pathlib import Path
+
+import numpy as np
+from flask import Flask, jsonify, request, send_from_directory
+from PIL import Image, ImageOps
+from werkzeug.serving import make_server
+
+ROOT = Path(__file__).resolve().parent.parent
+WEB = Path(__file__).resolve().parent / "web"
+sys.path.insert(0, str(ROOT))
+from app import backends  # noqa: E402
+from app.assist import NullAssist  # noqa: E402
+from dino import postprocess  # noqa: E402
+from dino.letterbox import Letterbox  # noqa: E402
+
+mimetypes.add_type("font/woff2", ".woff2")
+mimetypes.add_type("image/svg+xml", ".svg")
+mimetypes.add_type("application/manifest+json", ".webmanifest")
+
+APP_ID = "dino-studio"
+VERSION = "0.1.0"
+HUB_REPO = "dotimothy/sima-grounding-dino"
+DEFAULT_PORT = 8092
+MAX_IMAGE_BYTES = 40 << 20
+PALETTE = ["#16c8a6", "#3a86ec", "#f2801d", "#a9c81c", "#e5484d", "#b36bff", "#ffc21a", "#1fc3e8",
+           "#ff40a0", "#4bb54a", "#8f9bff", "#ff8a65"]
+
+
+class StudioError(Exception):
+    pass
+
+
+def log(msg: str) -> None:
+    print(f"[{time.strftime('%H:%M:%S')}] {msg}", flush=True)
+
+
+def default_models_dir() -> Path:
+    """DINO_MODELS_DIR, else what setup.sh --models-dir remembered, else /media/nvme/models/dino, else models/."""
+    env = os.environ.get("DINO_MODELS_DIR", "").strip()
+    if env:
+        return Path(env).expanduser()
+    remembered = ROOT / ".models-dir"
+    if remembered.is_file() and remembered.read_text().strip():
+        return Path(remembered.read_text().strip()).expanduser()
+    if Path("/media/nvme").is_dir():
+        return Path("/media/nvme/models/dino")
+    return ROOT / "models"
+
+
+def _free_bytes(path: Path) -> int:
+    path = Path(path)
+    while not path.exists() and path != path.parent:
+        path = path.parent
+    return shutil.disk_usage(path).free
+
+
+def _sha256(p: Path) -> str:
+    h = hashlib.sha256()
+    with open(p, "rb") as f:
+        while chunk := f.read(1 << 22):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+# --------------------------------------------------------------------------- local bundles
+def read_bundle(d: Path) -> dict | None:
+    try:
+        m = json.loads((d / "manifest.json").read_text())
+    except (OSError, ValueError):
+        return None
+    if m.get("kind") not in ("detector", "text"):
+        return None
+    return m
+
+
+def local_bundles(models_dir: Path) -> dict[str, dict]:
+    out = {}
+    if Path(models_dir).is_dir():
+        for d in sorted(Path(models_dir).iterdir()):
+            if d.is_dir() and not d.name.startswith("."):
+                m = read_bundle(d)
+                if m:
+                    out[d.name] = m
+    return out
+
+
+def verify_bundle(d: Path) -> tuple[bool, str]:
+    m = read_bundle(d)
+    if not m:
+        return False, "no readable manifest.json"
+    for rel, f in m.get("files", {}).items():
+        p = d / rel
+        if not p.is_file() or p.stat().st_size != f["bytes"]:
+            return False, f"{rel} is missing or the wrong size"
+        if _sha256(p) != f["sha256"]:
+            return False, f"{rel} does not match its checksum"
+    return True, "all files match"
+
+
+def bundle_bytes(d: Path) -> int:
+    return sum(p.stat().st_size for p in d.rglob("*") if p.is_file())
+
+
+# --------------------------------------------------------------------------- Hugging Face hub
+class Hub:
+    """Model bundles published on Hugging Face (tools/publish_hub.py) and fetching them.
+
+    models.json lists each bundle as one .tar.gz with its size and SHA-256. A download goes
+    to <models>/<name>.tar.gz.part (a stopped download continues), is checked, unpacked into a
+    hidden directory, checked file by file against the bundle manifest, and only then moved
+    to <models>/<name>, so the model list never sees half a model.
+    """
+
+    REFRESH = 300
+    NAME = re.compile(r"[a-z0-9][a-z0-9-]{0,48}")
+    FILE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,80}\.tar\.gz")
+    SPARE = 1 << 30
+
+    def __init__(self, repo: str, models_dir: Path):
+        self.repo, self.dir = repo, Path(models_dir)
+        self._lock = threading.Lock()
+        self._models: dict | None = None
+        self._fetched = 0.0
+        self._fetching = False
+        self._error: str | None = None
+        self._job: dict | None = None
+        self._failed: dict[str, str] = {}
+        self.quiet = False
+
+    def url(self, path: str) -> str:
+        return f"https://huggingface.co/{self.repo}/resolve/main/{path}"
+
+    def _refresh(self) -> None:
+        try:
+            req = urllib.request.Request(self.url("models.json"), headers={"User-Agent": "neat-dino-studio"})
+            with urllib.request.urlopen(req, timeout=15) as r:
+                doc = json.loads(r.read(1 << 20))
+            models = {}
+            for name, e in doc["models"].items():
+                files = e["files"]
+                if not (self.NAME.fullmatch(name) and re.fullmatch(r"[a-z0-9][a-z0-9_.-]{0,48}", e["path"])
+                        and len(files) == 1 and self.FILE.fullmatch(files[0]["name"])
+                        and isinstance(files[0]["bytes"], int) and re.fullmatch(r"[0-9a-f]{64}", files[0]["sha256"])
+                        and e.get("kind") in ("detector", "text")):
+                    raise ValueError(f"the entry for {name!r} is not one this app understands")
+                models[name] = e
+            self._models, self._error = models, None
+        except (OSError, ValueError, KeyError, TypeError) as e:
+            self._error = f"Could not read the model list from Hugging Face: {e}"
+        finally:
+            self._fetched, self._fetching = time.monotonic(), False
+
+    def models(self, wait: bool = False) -> dict:
+        if not self.repo:
+            return {}
+        with self._lock:
+            stale = time.monotonic() - self._fetched > (self.REFRESH if self._models is not None else 15)
+            if stale and not self._fetching:
+                self._fetching = True
+                t = threading.Thread(target=self._refresh, name="hub-list", daemon=True)
+                t.start()
+                if wait:
+                    t.join(20)
+        return self._models or {}
+
+    def _part(self, name: str) -> Path:
+        return self.dir / f".{name}.tar.gz.part"
+
+    def job(self) -> dict | None:
+        j = self._job
+        if j is None or not j["thread"].is_alive():
+            return None
+        secs = time.monotonic() - j["started"]
+        rate = j["fetched"] / secs if secs > 1 else 0
+        total = j["total"]
+        return {"name": j["name"], "stage": j["stage"], "fraction": round(j["done"] / total, 4) if total else 0,
+                "done_bytes": j["done"], "total_bytes": total, "bytes_per_second": int(rate),
+                "seconds_left": int((total - j["done"]) / rate) if rate else None}
+
+    def failed(self, name: str) -> str | None:
+        return self._failed.get(name)
+
+    def download(self, name: str, replace: bool = False) -> None:
+        e = self.models(wait=True).get(name)
+        if e is None:
+            raise StudioError(f"Hugging Face lists no model named {name!r}")
+        f = e["files"][0]
+        with self._lock:
+            if self._job is not None and self._job["thread"].is_alive():
+                raise StudioError(f"{self._job['name']} is downloading; one download at a time")
+            if not replace and (self.dir / name / "manifest.json").is_file():
+                raise StudioError(f"{name} is already on this board")
+            part = self._part(name)
+            need = f["bytes"] - (part.stat().st_size if part.is_file() else 0)
+            free = _free_bytes(self.dir)
+            if free < need + f["bytes"] + self.SPARE:       # the archive and the unpacked bundle
+                raise StudioError(f"Not enough disk for {name}: {(need + f['bytes']) >> 20} MB needed, "
+                                  f"{free >> 20} MB free")
+            self._failed.pop(name, None)
+            job = {"name": name, "done": 0, "fetched": 0, "total": f["bytes"], "stage": "download",
+                   "started": time.monotonic(), "cancel": threading.Event()}
+            job["thread"] = threading.Thread(target=self._run, args=(job, e), name="hub-download", daemon=True)
+            self._job = job
+            job["thread"].start()
+
+    def cancel(self, name: str) -> None:
+        j = self._job
+        if j is not None and j["name"] == name:
+            j["cancel"].set()
+
+    def discard(self, name: str) -> None:
+        j = self._job
+        if j is not None and j["name"] == name and j["thread"].is_alive():
+            raise StudioError(f"{name} is downloading; cancel it first")
+        self._part(name).unlink(missing_ok=True)
+        self._failed.pop(name, None)
+
+    def partial_bytes(self, name: str) -> int:
+        p = self._part(name)
+        j = self._job
+        if j is not None and j["name"] == name and j["thread"].is_alive():
+            return 0
+        return p.stat().st_size if p.is_file() else 0
+
+    def _run(self, job: dict, e: dict) -> None:
+        name, f = job["name"], e["files"][0]
+        part = self._part(name)
+        tmp = self.dir / f".{name}.unpack"
+        try:
+            self.dir.mkdir(parents=True, exist_ok=True)
+            have = part.stat().st_size if part.is_file() else 0
+            if have > f["bytes"]:
+                part.unlink()
+                have = 0
+            digest = hashlib.sha256()
+            if have:
+                with part.open("rb") as old:
+                    while chunk := old.read(1 << 22):
+                        digest.update(chunk)
+            job["done"] = have
+            headers = {"User-Agent": "neat-dino-studio", **({"Range": f"bytes={have}-"} if have else {})}
+            req = urllib.request.Request(self.url(f"{e['path']}/{f['name']}"), headers=headers)
+            with urllib.request.urlopen(req, timeout=60) as r:
+                if have and r.status != 206:
+                    have, digest, job["done"] = 0, hashlib.sha256(), 0
+                with part.open("ab" if have else "wb") as out:
+                    while chunk := r.read(1 << 20):
+                        if job["cancel"].is_set():
+                            raise InterruptedError()
+                        out.write(chunk)
+                        digest.update(chunk)
+                        job["done"] += len(chunk)
+                        job["fetched"] += len(chunk)
+                    out.flush()
+                    os.fsync(out.fileno())
+            size = part.stat().st_size
+            if size != f["bytes"] or digest.hexdigest() != f["sha256"]:
+                part.unlink(missing_ok=True)
+                raise ValueError(f"{f['name']} arrived damaged ({size} of {f['bytes']} bytes); try again")
+            job["stage"] = "unpack"
+            shutil.rmtree(tmp, ignore_errors=True)
+            tmp.mkdir()
+            with tarfile.open(part) as t:
+                for m in t.getmembers():
+                    if not (m.isfile() or m.isdir()) or m.name.startswith(("/", "..")) or ".." in Path(m.name).parts:
+                        raise ValueError(f"unexpected entry {m.name!r} in {f['name']}")
+                t.extractall(tmp, filter="data") if sys.version_info >= (3, 12) else t.extractall(tmp)
+            inner = [p for p in tmp.iterdir() if p.is_dir()]
+            src = inner[0] if len(inner) == 1 and not (tmp / "manifest.json").exists() else tmp
+            job["stage"] = "verify"
+            ok, why = verify_bundle(src)
+            if not ok:
+                raise ValueError(f"the unpacked model is not right: {why}")
+            dst = self.dir / name
+            old = self.dir / f".{name}.old"
+            if dst.exists():
+                os.replace(dst, old)
+            os.replace(src, dst)
+            shutil.rmtree(old, ignore_errors=True)
+            shutil.rmtree(tmp, ignore_errors=True)
+            part.unlink(missing_ok=True)
+            if not self.quiet:
+                log(f"downloaded {name} from {self.repo} ({f['bytes'] >> 20} MB)")
+        except InterruptedError:
+            self._failed[name] = "Download cancelled. What arrived is kept; Download continues from there."
+        except (OSError, ValueError, tarfile.TarError) as err:
+            self._failed[name] = f"The download stopped: {err}"
+            log(f"download of {name} failed: {err}")
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+
+# --------------------------------------------------------------------------- the studio
+class Studio:
+    """Model manager + detection. Every load/unload and every detection holds `lock`."""
+
+    def __init__(self, args):
+        self.args = args
+        self.models_dir = Path(args.models)
+        self.hub = Hub(args.hub_repo, self.models_dir)
+        self.lock = threading.RLock()
+        self.backend: backends.Backend | None = None
+        self.model: str | None = None
+        self.state = "empty"
+        self.stage: str | None = None
+        self.error: str | None = None
+        self.load_started = 0.0
+        self.load_seconds: float | None = None
+        self.last_image: str | None = None
+        self.last_ms: float | None = None
+        self.assist = NullAssist()
+        self.events: list[dict] = []
+        self._verified: dict[str, tuple] = {}
+
+    # ---- catalog
+    def catalog(self) -> dict:
+        local = local_bundles(self.models_dir)
+        hub = self.hub.models()
+        names = sorted(set(local) | set(hub), key=lambda n: (0 if (local.get(n) or hub.get(n, {})).get("kind") ==
+                                                              "detector" else 1, n))
+        job = self.hub.job()
+        out = []
+        for n in names:
+            m, e = local.get(n), hub.get(n)
+            meta = m or e
+            kind = meta.get("kind")
+            requires = (m or {}).get("requires") or (e or {}).get("requires")
+            state = "on_board" if m else "available"
+            if job and job["name"] == n:
+                state = "downloading"
+            mark = self._verified.get(n)
+            out.append({
+                "name": n, "kind": kind, "title": (e or {}).get("title") or self._title(meta, n),
+                "about": (e or {}).get("about", ""), "size": meta.get("size"), "precision": meta.get("precision"),
+                "latency_ms": (e or {}).get("latency_ms"), "requires": requires,
+                "requires_present": (requires in local) if requires else True,
+                "state": state, "bytes": bundle_bytes(self.models_dir / n) if m else (e or {}).get("files", [{}])[0].get("bytes"),
+                "download_bytes": (e or {}).get("files", [{}])[0].get("bytes") if e else None,
+                "partial_bytes": self.hub.partial_bytes(n) if e else 0,
+                "loaded": n == self.model and self.state in ("ready", "loading"),
+                "verified": mark[1] if mark else None, "verify_note": mark[2] if mark else None,
+                "progress": job if job and job["name"] == n else None, "error": self.hub.failed(n),
+                "on_hub": e is not None,
+            })
+        return {"models": out, "hub": {"repo": self.hub.repo, "page": f"https://huggingface.co/{self.hub.repo}" if
+                                       self.hub.repo else None, "error": self.hub._error,
+                                       "listed": self.hub._models is not None},
+                "directory": str(self.models_dir), "free_bytes": _free_bytes(self.models_dir),
+                "used_bytes": sum(bundle_bytes(self.models_dir / n) for n in local)}
+
+    @staticmethod
+    def _title(meta, name):
+        if meta.get("kind") == "text":
+            return "Text Encoder · BERT (64 Tokens)"
+        size = meta.get("size")
+        return {768: "Accurate · 768 px", 576: "Fast · 576 px"}.get(size, name)
+
+    def status(self) -> dict:
+        b = self.backend
+        return {"app": APP_ID, "version": VERSION, "state": self.state, "model": self.model, "stage": self.stage,
+                "error": self.error, "backend": self.args.backend, "size": b.size if b else None,
+                "loading_seconds": round(time.time() - self.load_started, 1) if self.state == "loading" else None,
+                "load_seconds": self.load_seconds, "last_ms": self.last_ms,
+                "https": bool(getattr(self.args, "tls", False)), "port": self.args.port,
+                "assist": self.assist.describe(), "max_tokens": 64}
+
+    # ---- loading
+    def _record(self, what: str, who: str = "") -> None:
+        self.events.append({"t": time.time(), "what": what, "who": who})
+        del self.events[:-50]
+        log(f"{what}" + (f" (from {who})" if who else ""))
+
+    def load(self, name: str, who: str = "") -> None:
+        with self.lock:
+            if self.state == "loading":
+                raise StudioError(f"{self.model} is still loading")
+            local = local_bundles(self.models_dir)
+            if self.args.backend == "mla":
+                m = local.get(name)
+                if m is None or m.get("kind") != "detector":
+                    raise StudioError(f"{name} is not a detector on this board")
+                req = m.get("requires")
+                if req and req not in local:
+                    raise StudioError(f"{name} needs {req}; download it first")
+            self.state, self.stage, self.error = "loading", "release", None
+            self.load_started = time.time()
+            previous = self.model
+            self.model = name
+            self._record(f"load {name}" + (f" (replacing {previous})" if previous else ""), who)
+        threading.Thread(target=self._load, args=(name,), name="model-load", daemon=True).start()
+
+    def _load(self, name: str) -> None:
+        try:
+            with self.lock:
+                if self.backend is not None:
+                    self.backend.close()
+                    self.backend = None
+                    time.sleep(0.5)               # never two detectors on the MLA at once
+                self.stage = "load"
+                b = self._make_backend(name)
+                self.stage = "warm"
+                pr = b.build_prompt("object .")
+                b.set_prompt(pr)
+                gray = np.full((b.size, b.size, 3), 114, np.uint8)
+                b.detect(gray, b.size, b.size)
+                self.backend, self.state, self.stage = b, "ready", None
+                self.load_seconds = round(time.time() - self.load_started, 1)
+                self.last_image = None
+                log(f"{name} ready in {self.load_seconds} s")
+        except Exception as e:  # noqa: BLE001
+            with self.lock:
+                self.backend, self.state, self.stage = None, "error", None
+                self.error = f"Loading {name} failed: {e}"
+            log(self.error)
+            traceback.print_exc()
+
+    def _make_backend(self, name: str) -> backends.Backend:
+        kind = self.args.backend
+        if kind == "fake":
+            return backends.FakeBackend(int(re.search(r"(\d{3})", name).group(1)) if re.search(r"\d{3}", name) else 576)
+        if kind == "torch":
+            size = int(re.search(r"(\d{3})", name).group(1)) if re.search(r"\d{3}", name) else 576
+            return backends.TorchBackend(size)
+        m = read_bundle(self.models_dir / name)
+        text = self.models_dir / m.get("requires", "dino-text-t64-bf16")
+        return backends.RuntimeBackend(self.args.runtime, self.models_dir / name, text,
+                                       log=lambda s: log(f"  dino_rt: {s}"))
+
+    def unload(self, who: str = "") -> None:
+        with self.lock:
+            if self.state == "loading":
+                raise StudioError("a model is loading; wait for it")
+            if self.backend is not None:
+                self.backend.close()
+            self._record(f"unload {self.model}", who)
+            self.backend, self.model, self.state, self.stage, self.error = None, None, "empty", None, None
+            self.last_image = None
+
+    def delete(self, name: str, who: str = "") -> None:
+        with self.lock:
+            if name == self.model and self.state in ("ready", "loading"):
+                raise StudioError(f"{name} is loaded; unload it first")
+            d = self.models_dir / name
+            if not (d / "manifest.json").is_file():
+                raise StudioError(f"{name} is not on this board")
+            shutil.rmtree(d)
+            self._verified.pop(name, None)
+            self._record(f"deleted {name}", who)
+
+    def verify(self, name: str) -> bool:
+        d = self.models_dir / name
+        if not d.is_dir():
+            raise StudioError(f"{name} is not on this board")
+        ok, why = verify_bundle(d)
+        self._verified[name] = (time.time(), ok, why)
+        return ok
+
+    # ---- detection
+    def parse(self, text: str) -> dict:
+        b = self.backend
+        if b is None:
+            from dino import prompt as P
+            tok = getattr(self, "_tok", None) or P.Tokenizer(self._any_text_bundle())
+            self._tok = tok
+            pr = P.build(text, tok, 64)
+        else:
+            pr = b.build_prompt(text)
+        return {"caption": pr.caption, "phrases": [{"text": p, "color": PALETTE[i % len(PALETTE)]}
+                                                   for i, p in enumerate(pr.phrases)],
+                "tokens": pr.n_tokens, "max_tokens": 64, "truncated": pr.truncated}
+
+    def _any_text_bundle(self):
+        for n, m in local_bundles(self.models_dir).items():
+            if m.get("kind") == "text":
+                return self.models_dir / n
+        return None
+
+    def detect(self, image_bytes: bytes | None, text: str, image_id: str | None, nms: float | None) -> dict:
+        with self.lock:
+            if self.backend is None or self.state != "ready":
+                raise StudioError("No model is loaded. Open Settings → Models to load one.")
+            b = self.backend
+            t0 = time.time()
+            text = self.assist.rewrite(text)              # LLiMa hook (does nothing today)
+            pr = b.build_prompt(text)
+            if not pr.phrases:
+                raise StudioError("Type at least one thing to find, e.g. “person . dog .”")
+            text_ms = b.set_prompt(pr)
+            same = image_bytes is None
+            dec_ms = 0.0
+            if same:
+                # Only the prompt changed: the backbone output of this image is still on the board.
+                if image_id is None or image_id != self.last_image:
+                    raise StudioError("The image is gone from the board; send it again")
+                lb = self._last_lb
+                det = b.detect(None, lb.new_w, lb.new_h, same_image=True)
+            else:
+                t_dec = time.time()
+                rgb, lb = self._letterbox(image_bytes, b.size)
+                dec_ms = (time.time() - t_dec) * 1e3
+                det = b.detect(rgb, lb.new_w, lb.new_h)
+                self.last_image = hashlib.sha1(image_bytes).hexdigest()[:16]
+                self._last_lb = lb
+            cands = postprocess.candidates(det.logits, det.boxes, pr, lb, floor=0.05, nms_iou=nms)
+            total = (time.time() - t0) * 1e3
+            self.last_ms = round(total, 1)
+            timing = {k: round(v, 1) for k, v in det.timing.items() if v}
+            timing["text"] = round(text_ms, 1)
+            if not same:
+                timing["decode"] = round(dec_ms, 1)
+            timing["postprocess"] = round((time.time() - t0) * 1e3 - sum(
+                v for k, v in timing.items() if k in ("total", "text", "decode")), 1)
+            timing["server_total"] = round(total, 1)
+            return {"model": self.model, "size": b.size, "image_id": self.last_image,
+                    "width": lb.width, "height": lb.height, "caption": pr.caption,
+                    "phrases": [{"text": p, "color": PALETTE[i % len(PALETTE)]} for i, p in enumerate(pr.phrases)],
+                    "truncated": pr.truncated, "tokens": pr.n_tokens, "detections": cands, "timing": timing,
+                    "same_image": same}
+
+    @staticmethod
+    def _letterbox(data: bytes, size: int) -> tuple[np.ndarray, Letterbox]:
+        img = Image.open(io.BytesIO(data))
+        if img.format == "JPEG":
+            img.draft("RGB", (size, size))                # decode at 1/2..1/8 scale when big
+        img = ImageOps.exif_transpose(img).convert("RGB")
+        w, h = img.size
+        s = size / max(w, h)
+        nw, nh = max(1, round(w * s)), max(1, round(h * s))
+        sq = np.zeros((size, size, 3), np.uint8)
+        sq[:nh, :nw] = np.asarray(img.resize((nw, nh), Image.BILINEAR))
+        return sq, Letterbox(size, s, w, h, nw, nh)
+
+    def reset_mla(self, who: str = "") -> str:
+        """The explicit 'Reset MLA' button: unload, then the DevKit's recovery ladder."""
+        with self.lock:
+            if self.backend is not None:
+                self.backend.close()
+            self.backend, self.model, self.state, self.stage = None, None, "empty", None
+            self._record("reset MLA", who)
+            cmds = []
+            if os.environ.get("DINO_RESET_COMMAND"):
+                cmds.append(["sh", "-c", os.environ["DINO_RESET_COMMAND"]])
+            if shutil.which("fix_devkit_runtime.sh"):
+                cmds.append(["sudo", "-n", "fix_devkit_runtime.sh"])
+            cmds.append(["sudo", "-n", "sh", "-c", "systemctl restart simaai-appcomplex.service && "
+                         "( [ -x /usr/bin/init_mla_memory.sh ] && /usr/bin/init_mla_memory.sh || true )"])
+            for c in cmds:
+                try:
+                    r = subprocess.run(c, capture_output=True, text=True, timeout=120)
+                    if r.returncode == 0:
+                        return f"MLA reset with {' '.join(c[:3])}"
+                except (OSError, subprocess.TimeoutExpired):
+                    continue
+            raise StudioError("Could not reset the MLA (needs passwordless sudo or DINO_RESET_COMMAND)")
+
+    def close(self) -> None:
+        with self.lock:
+            if self.backend is not None:
+                self.backend.close()
+                self.backend = None
+
+
+# --------------------------------------------------------------------------- web app
+def create_app(studio: Studio) -> Flask:
+    app = Flask(__name__, static_folder=None)
+    app.config["MAX_CONTENT_LENGTH"] = MAX_IMAGE_BYTES
+
+    def who():
+        return request.remote_addr or ""
+
+    def err(e, code=400):
+        return jsonify({"error": str(e)}), code
+
+    @app.get("/")
+    @app.get("/models")
+    def index():
+        return send_from_directory(WEB, "index.html", max_age=0)
+
+    @app.get("/static/<path:name>")
+    def static_files(name):
+        return send_from_directory(WEB, name, max_age=0 if name.endswith((".js", ".css", ".html")) else 3600)
+
+    @app.get("/api/status")
+    def api_status():
+        return jsonify(studio.status())
+
+    @app.get("/api/models")
+    def api_models():
+        return jsonify(studio.catalog())
+
+    @app.post("/api/models/<action>")
+    def api_models_action(action):
+        name = (request.get_json(silent=True) or {}).get("name", "")
+        try:
+            if action == "load":
+                studio.load(name, who())
+            elif action == "unload":
+                studio.unload(who())
+            elif action == "delete":
+                studio.delete(name, who())
+            elif action == "verify":
+                return jsonify({"ok": studio.verify(name), "models": studio.catalog()})
+            elif action == "download":
+                studio.hub.download(name)
+            elif action == "redownload":
+                studio.hub.download(name, replace=True)
+            elif action == "cancel":
+                studio.hub.cancel(name)
+            elif action == "discard":
+                studio.hub.discard(name)
+            else:
+                return err(f"unknown action {action}", 404)
+        except StudioError as e:
+            return err(e, 409)
+        return jsonify({"ok": True, "status": studio.status(), "models": studio.catalog()})
+
+    @app.post("/api/prompt/parse")
+    def api_parse():
+        try:
+            return jsonify(studio.parse((request.get_json(silent=True) or {}).get("text", "")))
+        except Exception as e:  # noqa: BLE001  (no tokenizer yet: nothing downloaded)
+            return err(e, 503)
+
+    @app.post("/api/prompt/assist")
+    def api_assist():
+        d = studio.assist.describe()
+        if not d["available"]:
+            return err("Prompt assist (LLiMa) is not enabled in this build", 503)
+        return jsonify({"text": studio.assist.rewrite((request.get_json(silent=True) or {}).get("text", ""))})
+
+    @app.post("/api/detect")
+    def api_detect():
+        f = request.files.get("image")
+        text = request.form.get("prompt", "")
+        image_id = request.form.get("image_id") or None
+        nms = request.form.get("nms")
+        try:
+            nms_v = float(nms) if nms not in (None, "", "0", "off") else None
+            data = f.read() if f else None
+            if data is None and image_id is None:
+                raise StudioError("Send an image")
+            return jsonify(studio.detect(data, text, image_id if data is None else None, nms_v))
+        except StudioError as e:
+            return err(e, 409)
+        except (OSError, ValueError) as e:
+            return err(f"Could not read that image: {e}")
+        except RuntimeError as e:                       # the runtime failed (dino_rt error)
+            log(f"detect failed: {e}")
+            return err(e, 500)
+
+    @app.post("/api/reset-mla")
+    def api_reset():
+        try:
+            return jsonify({"ok": True, "message": studio.reset_mla(who())})
+        except StudioError as e:
+            return err(e, 500)
+
+    return app
+
+
+def serve_both_protocols(server, cert: str, key: str) -> None:
+    """One port for HTTP and HTTPS: a TLS handshake starts with byte 0x16, an HTTP request never does."""
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    ctx.load_cert_chain(cert, key)
+    plain_finish = server.finish_request
+
+    def finish_request(req, client_address):
+        try:
+            req.settimeout(60)
+            first = req.recv(1, socket.MSG_PEEK)
+        except OSError:
+            return
+        if first != b"\x16":
+            req.settimeout(None)
+            plain_finish(req, client_address)
+            return
+        try:
+            tls = ctx.wrap_socket(req, server_side=True)
+        except (ssl.SSLError, OSError):
+            return
+        tls.settimeout(None)
+        try:
+            plain_finish(tls, client_address)
+        except ssl.SSLError:
+            pass
+        finally:
+            try:
+                tls.close()
+            except OSError:
+                pass
+
+    server.finish_request = finish_request
+
+
+def hub_command(args) -> int:
+    hub = Hub(args.hub_repo, Path(args.models))
+    hub.quiet = True
+    models = hub.models(wait=True)
+    if hub._error:
+        print(hub._error, file=sys.stderr)
+        return 1
+    if args.list_hub:
+        local = local_bundles(Path(args.models))
+        for n, e in models.items():
+            mark = "on board" if n in local else "available"
+            print(f"{n:24s} {e['files'][0]['bytes'] >> 20:6d} MB  {mark:10s} {e.get('title', '')}")
+        return 0
+    names = list(models) if args.fetch == ["all"] else args.fetch
+    for n in names:
+        e = models.get(n)
+        if e and e.get("requires") and e["requires"] not in names and not (Path(args.models) / e["requires"]).is_dir():
+            names.append(e["requires"])
+    rc = 0
+    for n in names:
+        if (Path(args.models) / n / "manifest.json").is_file():
+            print(f"{n}: already here")
+            continue
+        try:
+            hub.download(n)
+        except StudioError as e:
+            print(f"{n}: {e}", file=sys.stderr)
+            rc = 1
+            continue
+        while (j := hub.job()) is not None:
+            print(f"\r{n}: {j['stage']} {j['fraction'] * 100:5.1f}%  {j['bytes_per_second'] >> 20} MB/s   ",
+                  end="", flush=True)
+            time.sleep(1)
+        print()
+        if hub.failed(n):
+            print(f"{n}: {hub.failed(n)}", file=sys.stderr)
+            rc = 1
+        else:
+            print(f"{n}: done")
+    return rc
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--port", type=int, default=DEFAULT_PORT)
+    ap.add_argument("--host", default="0.0.0.0")
+    ap.add_argument("--model", default="", help="model to load at start (default: none; load from Settings)")
+    ap.add_argument("--models", default=str(default_models_dir()))
+    ap.add_argument("--backend", default="mla", choices=["mla", "torch", "fake"],
+                    help="mla on the board; torch (GPU) or fake to try the page on a PC")
+    ap.add_argument("--runtime", default=os.environ.get("DINO_RT") or str(ROOT / "runtime/build/dino_rt"))
+    ap.add_argument("--hub-repo", default=HUB_REPO)
+    ap.add_argument("--list-hub", action="store_true")
+    ap.add_argument("--fetch", nargs="+", metavar="NAME")
+    ap.add_argument("--no-https", dest="https", action="store_false")
+    ap.add_argument("--cert", default=str(ROOT / "webapp/certs/cert.pem"))
+    ap.add_argument("--key", default=str(ROOT / "webapp/certs/key.pem"))
+    args = ap.parse_args()
+    if args.list_hub or args.fetch:
+        return hub_command(args)
+    faulthandler.register(signal.SIGUSR1)
+    studio = Studio(args)
+    if args.model:
+        studio.load(args.model, "startup")
+    server = make_server(args.host, args.port, create_app(studio), threaded=True)
+    args.tls = False
+    if args.https and Path(args.cert).exists() and Path(args.key).exists():
+        serve_both_protocols(server, args.cert, args.key)
+        args.tls = True
+
+    def shutdown(signum, _frame):
+        log(f"signal {signum}: shutting down")
+        threading.Thread(target=server.shutdown, daemon=True).start()
+
+    for s in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
+        signal.signal(s, shutdown)
+    log(f"Neat DINO Studio on port {args.port} (backend {args.backend}, models {args.models})")
+    if args.tls:
+        log("the same port speaks HTTPS (self-signed) for the webcam")
+    try:
+        server.serve_forever()
+    finally:
+        faulthandler.dump_traceback_later(20, exit=True)
+        studio.close()
+        log("closed")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

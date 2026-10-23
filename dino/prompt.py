@@ -68,23 +68,123 @@ def special_masks(ids: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     return mask, pos
 
 
-class Tokenizer:
-    """BERT WordPiece via the `tokenizers` package (tokenizer.json next to the model)."""
+class WordPiece:
+    """Pure-Python BERT (uncased) tokenizer: basic tokenization + greedy WordPiece.
 
-    def __init__(self, path: str | Path | None = None):
-        from tokenizers import Tokenizer as HFTok
-        if path is None:
-            from huggingface_hub import hf_hub_download
-            path = hf_hub_download("IDEA-Research/grounding-dino-base", "tokenizer.json")
-        self.tok = HFTok.from_file(str(path))
-        self.tok.no_padding()
-        self.tok.no_truncation()
+    Used where the `tokenizers` package is missing (the DevKit). Matches
+    BertTokenizer(do_lower_case=True, strip_accents=None, tokenize_chinese_chars=True).
+    """
+
+    def __init__(self, vocab_path: str | Path):
+        self.vocab = {}
+        with open(vocab_path, encoding="utf-8") as f:
+            for i, line in enumerate(f):
+                self.vocab[line.rstrip("\n")] = i
+        self.inv = {i: t for t, i in self.vocab.items()}
+        self.unk = self.vocab["[UNK]"]
+
+    @staticmethod
+    def _is_punct(ch):
+        import unicodedata
+        cp = ord(ch)
+        if 33 <= cp <= 47 or 58 <= cp <= 64 or 91 <= cp <= 96 or 123 <= cp <= 126:
+            return True
+        return unicodedata.category(ch).startswith("P")
+
+    @staticmethod
+    def _is_cjk(cp):
+        return (0x4E00 <= cp <= 0x9FFF or 0x3400 <= cp <= 0x4DBF or 0x20000 <= cp <= 0x2A6DF
+                or 0x2A700 <= cp <= 0x2B73F or 0x2B740 <= cp <= 0x2B81F or 0x2B820 <= cp <= 0x2CEAF
+                or 0xF900 <= cp <= 0xFAFF or 0x2F800 <= cp <= 0x2FA1F)
+
+    def _basic(self, text):
+        import unicodedata
+        out = []
+        for ch in text:
+            cp = ord(ch)
+            if cp == 0 or cp == 0xFFFD or unicodedata.category(ch) in ("Cc", "Cf") and ch not in "\t\n\r":
+                continue
+            out.append(f" {ch} " if self._is_cjk(cp) else (" " if ch.isspace() else ch))
+        words = []
+        for w in "".join(out).lower().split():
+            w = "".join(c for c in unicodedata.normalize("NFD", w) if unicodedata.category(c) != "Mn")
+            cur = ""
+            for ch in w:
+                if self._is_punct(ch):
+                    if cur:
+                        words.append(cur)
+                        cur = ""
+                    words.append(ch)
+                else:
+                    cur += ch
+            if cur:
+                words.append(cur)
+        return words
+
+    def _wordpiece(self, word):
+        if len(word) > 100:
+            return [self.unk]
+        ids, start = [], 0
+        while start < len(word):
+            end, cur = len(word), None
+            while start < end:
+                sub = word[start:end] if start == 0 else "##" + word[start:end]
+                if sub in self.vocab:
+                    cur = self.vocab[sub]
+                    break
+                end -= 1
+            if cur is None:
+                return [self.unk]
+            ids.append(cur)
+            start = end
+        return ids
 
     def encode(self, text: str) -> list[int]:
-        return self.tok.encode(text).ids          # adds [CLS] ... [SEP]
+        ids = [CLS]
+        for w in self._basic(text):
+            ids += self._wordpiece(w)
+        return ids + [SEP]
 
     def decode(self, ids) -> str:
-        return self.tok.decode(list(ids))
+        toks = [self.inv.get(int(i), "[UNK]") for i in ids if int(i) not in (CLS, SEP, PAD)]
+        out = ""
+        for t in toks:
+            out += t[2:] if t.startswith("##") else (" " + t if out else t)
+        return out
+
+
+class Tokenizer:
+    """BERT WordPiece: the `tokenizers` package when installed, else the pure-Python WordPiece.
+
+    `path` is tokenizer.json or a directory holding tokenizer.json / vocab.txt.
+    """
+
+    def __init__(self, path: str | Path | None = None, pure_python: bool = False):
+        if path is None:
+            from huggingface_hub import hf_hub_download
+            path = Path(hf_hub_download("IDEA-Research/grounding-dino-base", "tokenizer.json")).parent
+        path = Path(path)
+        folder = path if path.is_dir() else path.parent
+        self.tok = None
+        if not pure_python:
+            try:
+                from tokenizers import Tokenizer as HFTok
+                self.tok = HFTok.from_file(str(folder / "tokenizer.json"))
+                self.tok.no_padding()
+                self.tok.no_truncation()
+            except ImportError:
+                self.tok = None
+        self.wp = None if self.tok is not None else WordPiece(folder / "vocab.txt")
+
+    def encode(self, text: str) -> list[int]:
+        if self.tok is not None:
+            return self.tok.encode(text).ids          # adds [CLS] ... [SEP]
+        return self.wp.encode(text)
+
+    def decode(self, ids) -> str:
+        if self.tok is not None:
+            return self.tok.decode(list(ids))
+        return self.wp.decode(ids)
 
 
 def build(text: str, tok: Tokenizer, T: int = 64, normalise: bool = True) -> Prompt:

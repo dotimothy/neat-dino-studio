@@ -38,7 +38,7 @@ args=""
 for a in "$@"; do args+=" $(printf '%q' "$a")"; done
 set +e
 docker exec -w "/workspace/$REL" -e HOME=/tmp -e "XLA_FLAGS=$XLA_FLAGS" \
-  -e "SIMA_MLA_SIM_PARALLEL=${SIMA_MLA_SIM_PARALLEL:-8}" ${SIMA_MLA_COMPILE_USE_JAX:+-e SIMA_MLA_COMPILE_USE_JAX=$SIMA_MLA_COMPILE_USE_JAX} -u "$(id -u):$(id -g)" "$CONTAINER" bash -c \
+  -e "SIMA_MLA_SIM_PARALLEL=${SIMA_MLA_SIM_PARALLEL:-8}" ${DINO_COMPILE_DEBUG:+-e DINO_COMPILE_DEBUG=1} ${SIMA_MLA_COMPILE_USE_JAX:+-e SIMA_MLA_COMPILE_USE_JAX=$SIMA_MLA_COMPILE_USE_JAX} -u "$(id -u):$(id -g)" "$CONTAINER" bash -c \
   "source /sdk-extensions/model-compiler/bin/activate && python3 -u compile/dino_compile.py$args" \
   2>&1 | tee "$HERE/$OUT/compile.log" > /dev/null
 rc=${PIPESTATUS[0]}

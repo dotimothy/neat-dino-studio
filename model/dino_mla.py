@@ -18,7 +18,9 @@ image-side ones:
                                        P position embedding, TP text pack
              out [X1 | V | OFF | AW | T]  (k < 6)
   enc_6      in [X | S | P | TP]
-             out [V_dec0..5 | T | HEAD]   HEAD ch 0-63 class logits, 64-67 box delta
+             out [HEAD | M | T]            HEAD ch 0-63 class logits, 64-67 box delta
+  dec_values in [M]                       (bound to enc_6's output, no copy)
+             out [V_dec0 .. V_dec5]
   dec_pre_k  in [H | QS0 | QS1 | TP]    H queries (900), QS sine of the ref box (512 = 2 x 256)
              out [H2 | OFF | AW]
   dec_post_k in [H2 | S | TP]
@@ -158,16 +160,29 @@ class TextStage(nn.Module):
 # --------------------------------------------------------------------------- Swin backbone
 
 def window_partition(x, ws):
-    """(1, C, H, W) -> (1, C, nW, ws*ws), windows row-major, tokens row-major."""
+    """(1, C, H, W) -> (1, C, nW, ws*ws) with 4-D reshapes/transposes only (the MLA rejects 6-D).
+
+    Windows come out column-major (index b * nh + a for window row a, column b);
+    tokens inside a window are row-major. Masks are built with this same function,
+    so the order is consistent everywhere.
+    """
     _, C, H, W = x.shape
-    x = x.reshape(1, C, H // ws, ws, W // ws, ws).permute(0, 1, 2, 4, 3, 5)
-    return x.reshape(1, C, (H // ws) * (W // ws), ws * ws)
+    nh, nw = H // ws, W // ws
+    x = x.reshape(1, C * nh * ws, nw, ws)          # (c, a, i) | b | j
+    x = x.permute(0, 2, 1, 3)                      # b | (c, a, i) | j
+    x = x.reshape(1, nw * C, nh, ws * ws)          # (b, c) | a | (i, j)
+    x = x.reshape(1, nw, C, nh * ws * ws)          # b | c | (a, t)
+    x = x.permute(0, 2, 1, 3)                      # c | b | (a, t)
+    return x.reshape(1, C, nw * nh, ws * ws)       # c | (b, a) | t
 
 
 def window_reverse(x, ws, H, W):
-    """(1, C, nW, ws*ws) -> (1, C, H, W)"""
-    C = x.shape[1]
-    x = x.reshape(1, C, H // ws, W // ws, ws, ws).permute(0, 1, 2, 4, 3, 5)
+    """Inverse of window_partition."""
+    _, C, nW, T = x.shape
+    nh, nw = H // ws, W // ws
+    x = x.reshape(1, C, nw, nh * T).permute(0, 2, 1, 3)              # b | c | (a, t)
+    x = x.reshape(1, nw * C, nh, T).reshape(1, nw, C * nh * ws, ws)  # b | (c, a, i) | j
+    x = x.permute(0, 2, 1, 3)                                         # (c, a, i) | b | j
     return x.reshape(1, C, H, W)
 
 
@@ -230,7 +245,10 @@ class SwinBlock(nn.Module):
             y = F.pad(y, (0, self.Wp - self.W, 0, self.Hp - self.H))
         if self.shift:
             y = roll_hw(y, -self.shift)
-        q, k, v = (window_partition(f(y), self.ws) for f in (self.q, self.k, self.v))
+        # Partition first, then project: the 1x1 convs act per token, and the MLA only
+        # accepts the attention Einsums when their inputs are conv outputs.
+        yw = window_partition(y, self.ws)                  # (1, C, nW, 144)
+        q, k, v = self.q(yw), self.k(yw), self.v(yw)
         outs = []
         for h in range(self.heads):
             sl = slice(h * self.hd, (h + 1) * self.hd)
@@ -239,13 +257,80 @@ class SwinBlock(nn.Module):
                 s = s + self.mask
             p = torch.softmax(s, dim=1)
             outs.append(torch.einsum("nchw,nqhc->nqhw", p, v[:, sl]))
-        o = window_reverse(torch.cat(outs, 1), self.ws, self.Hp, self.Wp)
+        o = window_reverse(self.o(torch.cat(outs, 1)), self.ws, self.Hp, self.Wp)
         if self.shift:
             o = roll_hw(o, self.shift)
         if (self.Hp, self.Wp) != (self.H, self.W):
             o = o[:, :, : self.H, : self.W]
-        x = x + self.o(o)
+        x = x + o
         return x + self.fc2(gelu(self.fc1(self.ln2(x))))
+
+
+class SwinBlockW(nn.Module):
+    """A Swin block on tokens that are already in window layout (1, C, nW, ws*ws).
+
+    LayerNorm, the convs and the MLP act per token, so token order doesn't matter to
+    them; only attention needs windows, and its input arrives windowed. The CPU moves
+    tokens between the plain and the shifted window layout between blocks (fixed
+    gathers, see swin_layouts), so no reshape ever runs on the MLA.
+
+    With padding (stage 4 at 576: 18 -> 24), padded tokens are zeroed after the first
+    LayerNorm, as HF pads the normalised features with zeros.
+    """
+
+    def __init__(self, layer, H, W, ws=12, merge=None, embed=None):
+        super().__init__()
+        ref = SwinBlock(layer, H, W, ws)
+        self.heads, self.hd, self.ws, self.shift = ref.heads, ref.hd, ws, ref.shift
+        self.ln1, self.ln2, self.q, self.k, self.v, self.o, self.fc1, self.fc2 = (
+            ref.ln1, ref.ln2, ref.q, ref.k, ref.v, ref.o, ref.fc1, ref.fc2)
+        self.register_buffer("bias", ref.bias)
+        self.mask = ref.mask
+        self.merge = merge                    # PatchMerge's LN + reduction, applied first (stage start)
+        self.embed = embed                    # patch embedding conv + LN (very first block)
+        Hp, Wp = ref.Hp, ref.Wp
+        if (Hp, Wp) != (H, W):
+            m = torch.zeros(1, 1, Hp, Wp)
+            m[:, :, :H, :W] = 1
+            win = window_partition(roll_hw(m, -self.shift) if self.shift else m, ws)
+            C = layer.layernorm_before.normalized_shape[0]
+            self.register_buffer("pad", win.expand(1, C, -1, -1).contiguous())
+        else:
+            self.pad = None
+
+    def forward(self, x):
+        if self.embed is not None:
+            x = self.embed(x)
+        if self.merge is not None:
+            x = self.merge.red(self.merge.ln(x))
+        y = self.ln1(x)
+        if self.pad is not None:
+            y = y * self.pad
+        q, k, v = self.q(y), self.k(y), self.v(y)
+        outs = []
+        for h in range(self.heads):
+            sl = slice(h * self.hd, (h + 1) * self.hd)
+            s = torch.einsum("nchw,nchq->nqhw", q[:, sl], k[:, sl]) + self.bias[h]
+            if self.mask is not None:
+                s = s + self.mask
+            outs.append(torch.einsum("nchw,nqhc->nqhw", torch.softmax(s, dim=1), v[:, sl]))
+        x = x + self.o(torch.cat(outs, 1))
+        return x + self.fc2(gelu(self.fc1(self.ln2(x))))
+
+
+class PatchEmbed(nn.Module):
+    """4x4 patch conv as a 1x1 conv on the host's space-to-depth input, then LayerNorm."""
+
+    def __init__(self, sw):
+        super().__init__()
+        pe = sw.embeddings.patch_embeddings.projection
+        self.patch = nn.Conv2d(48, 128, 1)
+        self.patch.weight.data.copy_(pe.weight.detach().reshape(128, 48)[:, :, None, None])
+        self.patch.bias.data.copy_(pe.bias.detach())
+        self.ln = LN(sw.embeddings.norm)
+
+    def forward(self, x):
+        return self.ln(self.patch(x))
 
 
 class PatchMerge(nn.Module):
@@ -427,7 +512,7 @@ def pack_tp(t, tpos, smask, kmask):
 class EncStage(nn.Module):
     """k = 0: [X | P | TP] -> [X1 | V | OFF | AW | T]
        1..5: [X | S | P | TP] -> same
-       6:    [X | S | P | TP] -> [V_dec0..5 | T | HEAD]"""
+       6:    [X | S | P | TP] -> [HEAD | M | T]"""
 
     def __init__(self, hf, k, N):
         super().__init__()
@@ -438,11 +523,14 @@ class EncStage(nn.Module):
             self.pre = EncLayerPre(enc[k])
         else:
             m = hf.model
-            self.dec_value = nn.ModuleList(conv_from_linear(L.encoder_attn.value_proj) for L in m.decoder.layers)
             self.enc_out = conv_from_linear(m.enc_output)
             self.enc_ln = LN(m.enc_output_norm)
             be = m.encoder_output_bbox_embed
-            self.bbox = nn.ModuleList(conv_from_linear(l) for l in be.layers)
+            # The last layer is zero-padded to 192 outputs so HEAD = [64 logits | 192] needs no
+            # zero concat: a 4-channel conv output over thousands of tokens fails to compile.
+            n = len(be.layers)
+            self.bbox = nn.ModuleList(conv_from_linear(l, out_pad=(D - T_TXT - 4) if i == n - 1 else 0)
+                                      for i, l in enumerate(be.layers))
 
     def forward(self, x):
         N = self.N
@@ -455,8 +543,7 @@ class EncStage(nn.Module):
         if self.k < 6:
             X1, V, OFF, AW, T = self.pre(X, P, t, tpos, sm, km)
             return torch.cat([X1, V, OFF, AW, T], 3)
-        # final: decoder value maps, class logits and box deltas of every token
-        vals = [f(X) for f in self.dec_value]
+        # final: memory, text, class logits and box deltas of every token
         oq = self.enc_ln(self.enc_out(X))
         logits = torch.einsum("nchw,nchq->nqhw", oq, t)        # (1, 64, 1, N)
         b = oq
@@ -464,8 +551,23 @@ class EncStage(nn.Module):
             b = l(b)
             if i < len(self.bbox) - 1:
                 b = F.relu(b)
-        head = torch.cat([logits, b, torch.zeros(1, D - T_TXT - 4, 1, N)], 1)
-        return torch.cat(vals + [t, head], 3)
+        head = torch.cat([logits, b], 1)
+        # HEAD first: with HEAD last the compiler fails to generate code for the output concat.
+        return torch.cat([head, X, t], 3)
+
+
+class DecValues(nn.Module):
+    """[M] -> [V_dec0 .. V_dec5]: every decoder layer's value projection of the memory.
+
+    Its input is exactly the M columns of enc_6's output, so the runtime binds it to
+    that span instead of copying."""
+
+    def __init__(self, hf):
+        super().__init__()
+        self.proj = nn.ModuleList(conv_from_linear(L.encoder_attn.value_proj) for L in hf.model.decoder.layers)
+
+    def forward(self, m):
+        return torch.cat([f(m) for f in self.proj], 3)
 
 
 # --------------------------------------------------------------------------- decoder
@@ -637,6 +739,7 @@ class Pipeline:
         self.enc = nn.ModuleList(EncStage(hf, k, N) for k in range(7))
         self.dec_pre = nn.ModuleList(DecPre(hf, k) for k in range(6))
         self.dec_post = nn.ModuleList(DecPost(hf, k) for k in range(6))
+        self.dec_values = DecValues(hf)
         ib = hf.model.enc_output_norm(hf.model.enc_output(torch.zeros(1, D)))   # object query of invalid tokens
         self.invalid_query = ib.detach()[0]
         self.run_stage = stages or (lambda name, mod, x: mod(x))
@@ -672,8 +775,8 @@ class Pipeline:
             s = self._sample_enc(V, OFF, AW, ref)
             tp = torch.cat([T, tp[:, :, :, T_TXT:]], 3)
             x_in = torch.cat([X1, s, g.pos, tp], 3)
-        vals = wsplit(out, [N] * 6 + [T_TXT, N])
-        dvals, T6, head = vals[:6], vals[6], vals[7]
+        head, Mem, T6 = wsplit(out, [N, N, T_TXT])
+        dvals = wsplit(run("dec_values", self.dec_values, Mem), [N] * 6)
         tp = torch.cat([T6, tp[:, :, :, T_TXT:]], 3)
         self.trace["enc_text"] = T6
         # two-stage top-k on the host

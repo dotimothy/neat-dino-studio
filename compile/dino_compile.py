@@ -125,7 +125,7 @@ def main():
     ap.add_argument("--name", default=None, help="model name inside the MPK")
     ap.add_argument("--out", default=None)
     ap.add_argument("--no-compile", action="store_true", help="quantize only")
-    ap.add_argument("--mla-tess", choices=["ev74", "hwc", "hwc16"], default="hwc16",
+    ap.add_argument("--mla-tess", choices=["ev74", "hwc", "hwc16"], default="hwc",
                     help="where (de)tessellation runs: ev74 plugins, or on the MLA with this DRAM "
                          "layout (default; EV74 tessellation of wide token tensors takes seconds)")
     ap.add_argument("--io-dtype", choices=["fp32", "bf16"], default="fp32",
@@ -179,7 +179,7 @@ def main():
                                             persistent_mem_name=None, dram_shape=None)
             kw["tessellate_parameters"] = get_tessellate_parameters(q, {0: tp}, {0: tp})
             log(f"  tessellation on the MLA, DRAM layout {lay}")
-        q.compile(output_path=out, batch_size=1, log_level=logging.INFO, **kw)
+        q.compile(output_path=out, batch_size=1, log_level=logging.DEBUG if os.environ.get("DINO_COMPILE_DEBUG") else logging.INFO, **kw)
         log(f"  compiled ({time.time() - t0:.0f} s total)")
         s = summarize_mpk(out) or {}
         summary.update(s)
