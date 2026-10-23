@@ -49,7 +49,7 @@ cd neat-dino-studio && ./setup.sh          # builds the runtime, fetches the Fas
 neat-dino                                  # (new shell) then open https://<board-ip>:8092/
 ```
 
-`setup.sh --fetch accurate|all` fetches more models; `webapp/run.sh --daemon` runs it in the
+`setup.sh --fetch accurate|tiny|all` fetches more models; `webapp/run.sh --daemon` runs it in the
 background and `webapp/run.sh --stop` stops it (freeing the MLA). `neat-dino update` updates in place.
 The page also works over plain HTTP, but browsers only allow the webcam on HTTPS; the studio
 serves both on the same port with a self-signed certificate (accept the warning once).
@@ -94,7 +94,7 @@ that are sampling. Replies come back in request order.
 The bf16 builds on the MLA match the FP32 models. Tiny ([IDEA-Research/grounding-dino-tiny](https://huggingface.co/IDEA-Research/grounding-dino-tiny):
 Swin-T backbone, its own BERT weights) is only ~12 % faster than Base at 576: its backbone takes half the time, but most of
 the time goes to the encoder's deformable sampling on the CPU, which is the same for both. Its bundles
-(`dino-tiny-576-bf16` + `dino-tiny-text-t64-bf16`) are not on Hugging Face yet; build them with `--model tiny` (below).
+(`dino-tiny-576-bf16` + `dino-tiny-text-t64-bf16`) download from Settings → Models or with `setup.sh --fetch tiny`.
 See `report.md` for details.
 
 ## Build it yourself

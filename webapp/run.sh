@@ -51,7 +51,7 @@ for a in "$@"; do
     fetch=()
     for b in "$@"; do
       case "$b" in
-        fast) fetch+=(dino-576-bf16) ;; accurate) fetch+=(dino-768-bf16) ;; *) fetch+=("$b") ;;
+        fast) fetch+=(dino-576-bf16) ;; accurate) fetch+=(dino-768-bf16) ;; tiny) fetch+=(dino-tiny-576-bf16) ;; *) fetch+=("$b") ;;
       esac
     done
     cd "$ROOT" && exec "$PY" "$HERE/server.py" "${args[@]}" "${fetch[@]}"

@@ -99,7 +99,7 @@ fi
 if ((!check)) && [[ "$fetch" != none ]]; then
   names=()
   case "$fetch" in
-    fast) names=(dino-576-bf16) ;; accurate) names=(dino-768-bf16) ;; all) names=(all) ;; *) names=("$fetch") ;;
+    fast) names=(dino-576-bf16) ;; accurate) names=(dino-768-bf16) ;; tiny) names=(dino-tiny-576-bf16) ;; all) names=(all) ;; *) names=("$fetch") ;;
   esac
   "$PY" "$ROOT/webapp/server.py" --models "$MODELS" --fetch "${names[@]}" || warn "download did not finish (re-run: webapp/run.sh --fetch ${fetch})"
 fi

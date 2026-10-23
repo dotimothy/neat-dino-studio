@@ -31,6 +31,8 @@ ABOUT = {
     "dino-text-t64-bf16": ("Text Encoder · BERT (64 Tokens)", "BERT-base + projection, used by every Base detector."),
     "dino-576-bf16": ("Fast · 576 px", "Grounding DINO base at 576 px: best for the webcam."),
     "dino-768-bf16": ("Accurate · 768 px", "Grounding DINO base at 768 px: finds smaller things."),
+    "dino-tiny-text-t64-bf16": ("Tiny Text Encoder · BERT (64 Tokens)", "Grounding DINO Tiny's BERT-base + projection."),
+    "dino-tiny-576-bf16": ("Tiny · 576 px", "Grounding DINO tiny (Swin-T, 172.2 M) at 576 px: a bit quicker, smaller."),
 }
 
 
@@ -62,13 +64,15 @@ pipeline_tag: zero-shot-object-detection
 tags: [sima-ai, modalix, mla, grounding-dino, open-vocabulary-detection, edge]
 ---
 
-# Grounding DINO (base) for SiMa.ai Modalix
+# Grounding DINO (base and tiny) for SiMa.ai Modalix
 
 [{UPSTREAM}](https://huggingface.co/{UPSTREAM}) compiled for the SiMa.ai Modalix MLA, for
 [Neat DINO Studio](https://github.com/dotimothy/neat-dino-studio): type what to find
 ("person . red car . dog ."), get boxes, from a photo or a live webcam.
 
 **Weights:** [{UPSTREAM}](https://huggingface.co/{UPSTREAM}), the **Base** size of Grounding DINO: **232.3 M parameters** in total (Swin-B image backbone 86.9 M, BERT-base text encoder 108.9 M, feature enhancer, deformable decoder and heads 36.5 M), unchanged from the original and run in bf16. Apache-2.0.
+
+The `dino-tiny-*` bundles are [IDEA-Research/grounding-dino-tiny](https://huggingface.co/IDEA-Research/grounding-dino-tiny) instead: **172.2 M parameters** (Swin-T backbone 27.5 M, its own BERT-base weights 108.9 M, the rest 35.8 M), also unchanged and in bf16. A Tiny detector needs the Tiny text encoder.
 
 | Bundle | What | Size | Per image (board) | About |
 |---|---|---|---|---|
@@ -84,12 +88,14 @@ query selection, the reference-box updates, and Swin patch merging. The runtime 
 runs the ELFs with SimaLMM's `MLAModelWithBuffer`, reads and writes their bf16 buffers in
 place, and keeps two frames in flight in Live mode.
 
-| Measured on a Modalix DevKit | Fast · 576 px | Accurate · 768 px |
-|---|---|---|
-| Per new image | 0.33 s | 0.54 s |
-| Live, two frames in flight | 3.9 FPS | 2.3 FPS |
-| COCO AP, 500-image val2017 subset (square letterbox) | 42.0 | 46.4 |
-| Same, FP32 PyTorch on GPU, same inputs | 41.7 | 45.8 |
+| Measured on a Modalix DevKit | Base · Fast · 576 px | Base · Accurate · 768 px | Tiny · 576 px |
+|---|---|---|---|
+| Per new image | 0.33 s | 0.54 s | 0.29 s |
+| Live, two frames in flight | 3.9 FPS | 2.3 FPS | 4.3 FPS |
+| COCO AP, 500-image val2017 subset (square letterbox) | 42.0 | 46.4 | 41.8 |
+| Same, FP32 PyTorch on GPU, same inputs | 41.7 | 45.8 | 41.4 |
+
+Tiny's ELFs: text encoder 1, Swin-T backbone 7, encoder 7, decoder 13.
 
 Use the bundles with the studio (Settings → Models downloads them) or `webapp/run.sh --fetch fast`.
 
