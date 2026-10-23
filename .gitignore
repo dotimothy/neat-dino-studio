@@ -1,0 +1,9 @@
+.venv/
+build/
+data/coco/
+data/images/*.jpg
+__pycache__/
+*.pyc
+webapp/certs/
+webapp/uploads/
+.models-dir
