@@ -28,7 +28,7 @@ COLLECTION_ABOUT = "Open-vocabulary detectors compiled for SiMa.ai Modalix: type
 UPSTREAM = "IDEA-Research/grounding-dino-base"
 
 ABOUT = {
-    "dino-text-t64-bf16": ("Text Encoder · BERT (64 Tokens)", "BERT-base + projection, shared by every detector."),
+    "dino-text-t64-bf16": ("Text Encoder · BERT (64 Tokens)", "BERT-base + projection, used by every Base detector."),
     "dino-576-bf16": ("Fast · 576 px", "Grounding DINO base at 576 px: best for the webcam."),
     "dino-768-bf16": ("Accurate · 768 px", "Grounding DINO base at 768 px: finds smaller things."),
 }

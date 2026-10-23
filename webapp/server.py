@@ -448,6 +448,7 @@ class Studio:
             info = model_info(n, m or e)
             out.append({
                 "name": n, "kind": kind, "title": info["title"], "short": info["short"], "details": info["details"],
+                "variant": info.get("variant", "base"),
                 "about": (e or {}).get("about", ""), "size": meta.get("size"), "precision": meta.get("precision"),
                 "latency_ms": (e or {}).get("latency_ms"), "requires": requires,
                 "requires_present": (requires in local) if requires else True,

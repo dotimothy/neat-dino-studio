@@ -1106,7 +1106,7 @@ function modelRow(m) {
   el.querySelector(".name").innerHTML = `<span></span>${tags.join("")}`;
   el.querySelector(".name span").textContent = m.title;
   const meta = [m.details, fmtBytes(m.bytes)];
-  if (m.kind === "text") meta.push("shared by every detector");
+  if (m.kind === "text") meta.push(m.variant === "tiny" ? "used by the Tiny detector" : "used by every Base detector");
   if (m.latency_ms) meta.push(`~${Math.round(m.latency_ms)} ms per image`);
   if (m.kind === "detector" && m.requires && !m.requires_present) meta.push("needs the text encoder");
   el.querySelector(".meta").textContent = meta.filter(Boolean).join(" · ") + (m.about ? ` — ${m.about}` : "");
