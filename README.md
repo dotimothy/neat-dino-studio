@@ -37,7 +37,8 @@ Type or say what to find — <code>person . red car . dog with a frisbee .</code
 - **Model manager.** Download, verify, load and delete models from Hugging Face in Settings → Models. One detector runs on the MLA at a time.
   The voice models download from Settings → Voice.
 - **Your camera and microphone.** Settings → Devices picks them, with a live preview and a level meter.
-- **Two sizes.** *Fast* (576 px) for the webcam, *Accurate* (768 px) for small objects. Both are bf16.
+- **Two sizes of Base, and Tiny.** *Fast* (576 px) for the webcam, *Accurate* (768 px) for small objects, both
+  Grounding DINO Base. Grounding DINO **Tiny** (576 px) is also supported: a bit quicker and a smaller bundle. All bf16.
 
 ## Install (Modalix DevKit)
 
@@ -80,15 +81,21 @@ app (`webapp/server.py`) talks to it as a child process; unloading a model stops
 running; the MLA goes to the older frame first, and the CPU threads are split between the slots
 that are sampling. Replies come back in request order.
 
-| | Fast · 576 px | Accurate · 768 px |
-|---|---|---|
-| Per new image (board) | 0.33 s | 0.54 s |
-| Prompt change, same image | 0.25 s | 0.41 s |
-| Live (two frames in flight), runtime | 3.9 FPS | 2.3 FPS |
-| COCO AP, board (500-image val subset) | 42.0 | 46.4 |
-| COCO AP, FP32 PyTorch, same inputs | 41.7 | 45.8 |
+| | Base · Fast · 576 px | Base · Accurate · 768 px | Tiny · 576 px |
+|---|---|---|---|
+| Parameters | 232.3 M | 232.3 M | 172.2 M |
+| Per new image (board) | 0.33 s | 0.54 s | 0.29 s |
+| Prompt change, same image | 0.25 s | 0.41 s | 0.24 s |
+| Live (two frames in flight), runtime | 3.9 FPS | 2.3 FPS | 4.3 FPS |
+| COCO AP, board (500-image val subset) | 42.0 | 46.4 | 41.8 |
+| COCO AP, FP32 PyTorch, same inputs | 41.7 | 45.8 | 41.4 |
+| Bundle | 1.8 GB | 1.5 GB | 1.0 GB |
 
-The bf16 build on the MLA matches the FP32 model. See `report.md` for details.
+The bf16 builds on the MLA match the FP32 models. Tiny ([IDEA-Research/grounding-dino-tiny](https://huggingface.co/IDEA-Research/grounding-dino-tiny):
+Swin-T backbone, its own BERT weights) is only ~12 % faster than Base at 576: its backbone takes half the time, but most of
+the time goes to the encoder's deformable sampling on the CPU, which is the same for both. Its bundles
+(`dino-tiny-576-bf16` + `dino-tiny-text-t64-bf16`) are not on Hugging Face yet; build them with `--model tiny` (below).
+See `report.md` for details.
 
 ## Build it yourself
 
@@ -110,6 +117,7 @@ webapp/                  the studio (Flask + plain JS, no build step)
 .venv/bin/python model/export_onnx.py --size 576 --all      # ONNX for every stage
 compile/build_stages.sh 576                                 # compile them all (NEAT SDK container)
 .venv/bin/python tools/make_bundle.py --size 576 --text     # bundles in build/bundles/
+# Grounding DINO Tiny: the same steps with --model tiny (MODEL=tiny for build_stages.sh)
 BOARD=sima@<board-ip> ./deploy.sh --models --build          # to a DevKit
 ```
 
