@@ -14,7 +14,13 @@ for n in "$@"; do
   mpk=$(ls "$P/$n"/*_mpk.tar.gz 2>/dev/null | head -1 || true)
   [[ -n "$mpk" ]] || { echo "$n: no MPK in $P/$n"; continue; }
   cp -f "$mpk" "$P/$n.tar.gz"
-  files+=("$P/$n.tar.gz" "$P/${n}_in.npy")
+  files+=("$P/$n.tar.gz")
+  if [[ -f "$P/${n}_inputs.txt" ]]; then
+    files+=("$P/${n}_inputs.txt")
+    for i in $(cat "$P/${n}_inputs.txt"); do files+=("$P/${n}_in_$i.npy"); done
+  else
+    files+=("$P/${n}_in.npy")
+  fi
   names+=("$n")
 done
 [[ ${#names[@]} -gt 0 ]] || exit 1

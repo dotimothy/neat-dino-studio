@@ -1,14 +1,16 @@
 #!/usr/bin/env python3
-"""Run single-input MPKs on the DevKit with pyneat and save their outputs.
+"""Run MPKs on the DevKit with pyneat and save their outputs.
 
 Runs on the board (pyneat venv). For each <name>: loads <dir>/<name>.tar.gz, feeds
-<dir>/<name>_in.npy (1, C, H, W) as one HWC tensor, saves the raw output as
+<dir>/<name>_in.npy (1, C, H, W) as one HWC tensor (or, for several inputs, the files
+<name>_in_<input>.npy in the order listed in <name>_inputs.txt), saves the raw output as
 <dir>/<name>_board.npy and the wall-clock timing as <dir>/<name>_board.json.
 
     python3 board_run.py --dir /media/nvme/dino-dev/probes gs24 gs96
 """
 import argparse
 import json
+import os
 import statistics
 import sys
 import time
@@ -18,25 +20,32 @@ import pyneat
 
 
 def run_one(d, name, iters, timeout_ms):
-    x = np.load(f"{d}/{name}_in.npy").astype(np.float32)
-    hwc = np.ascontiguousarray(x[0].transpose(1, 2, 0))
+    if os.path.exists(f"{d}/{name}_inputs.txt"):
+        names = open(f"{d}/{name}_inputs.txt").read().split()
+        xs = [np.load(f"{d}/{name}_in_{n}.npy").astype(np.float32) for n in names]
+    else:
+        xs = [np.load(f"{d}/{name}_in.npy").astype(np.float32)]
+    hwcs = [np.ascontiguousarray(x[0].transpose(1, 2, 0)) for x in xs]
 
-    def tensor():
-        t = pyneat.Tensor.from_numpy(hwc, copy=True)
-        t.layout = pyneat.TensorLayout.HWC
-        return t
+    def tensors():
+        out = []
+        for hwc in hwcs:
+            t = pyneat.Tensor.from_numpy(hwc, copy=True)
+            t.layout = pyneat.TensorLayout.HWC
+            out.append(t)
+        return out
 
     t0 = time.time()
     model = pyneat.Model(f"{d}/{name}.tar.gz")
-    runner = model.build([tensor()])
+    runner = model.build(tensors())
     load_s = time.time() - t0
-    out = runner.run([tensor()], timeout_ms=timeout_ms)
+    out = runner.run(tensors(), timeout_ms=timeout_ms)
     outs = [np.array(o.to_numpy(), dtype=np.float32, copy=True) for o in out]
     del out
     wall = []
     for _ in range(iters):
         s = time.perf_counter()
-        o = runner.run([tensor()], timeout_ms=timeout_ms)
+        o = runner.run(tensors(), timeout_ms=timeout_ms)
         wall.append((time.perf_counter() - s) * 1e3)
         del o
     del runner, model
