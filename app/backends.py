@@ -35,10 +35,10 @@ class Backend:
 class RuntimeBackend(Backend):
     name = "mla"
 
-    def __init__(self, binary, bundle, text_bundle, log=None):
+    def __init__(self, binary, bundle, text_bundle, log=None, progress=None):
         self.text = TextEncoderHost(text_bundle)
         with ACCELERATOR_LOCK:
-            self.rt = DinoRuntime(binary, bundle, text_bundle, log=log)
+            self.rt = DinoRuntime(binary, bundle, text_bundle, log=log, progress=progress)
         self.size = self.rt.size
         self.tokenizer = self.text.tok
         self._prompt_key = None

@@ -82,15 +82,20 @@ function renderStatus() {
     return;
   }
   $("#assist-row").hidden = !(st.assist && st.assist.available);
+  const info = st.model_info;
+  const narrow = matchMedia("(max-width: 600px)").matches;
+  $("#model-pill").title = info ? `${info.title}\n${info.details}` : "Models";
+  $("#det-model").textContent = info && st.state === "ready" ? info.title : "";
   if (st.state === "ready") {
     dot.classList.add("ready");
-    name.textContent = matchMedia("(max-width: 600px)").matches ? prettyModel(st.model).split(" · ")[0] : prettyModel(st.model);
+    name.textContent = narrow ? info.short : info.title;
     if (st.last_ms) ms.textContent = `${Math.round(st.last_ms)} ms`;
     banner.hidden = true;
-  } else if (st.state === "loading") {
+  } else if (st.state === "loading" || st.state === "unloading") {
     dot.classList.add("loading");
-    name.textContent = `Loading ${prettyModel(st.model)}…`;
-    showBanner(`Loading ${prettyModel(st.model)} (${st.stage || "starting"}, ${Math.round(st.loading_seconds || 0)} s)…`);
+    const what = info ? info.short : "model";
+    name.textContent = st.state === "loading" ? `Loading ${what}…` : `Unloading ${what}…`;
+    showProgressBanner(st);
   } else if (st.state === "error") {
     dot.classList.add("error");
     name.textContent = "Load Failed";
@@ -103,9 +108,38 @@ function renderStatus() {
     (st.load_seconds ? `, loaded in ${st.load_seconds} s` : "");
 }
 
+// Model loading / unloading: what is happening, with a bar that moves.
+function showProgressBanner(st) {
+  const b = $("#banner");
+  const p = st.progress || {};
+  const info = st.model_info;
+  b.hidden = false;
+  b.classList.remove("err");
+  b.classList.add("progress-banner");
+  b.innerHTML = `<span class="spinner"></span><div class="pb-text"><div class="pb-title"></div><div class="pb-detail muted small"></div>
+    <div class="pbar"><span></span></div></div><span class="pb-time muted small"></span>`;
+  b.querySelector(".pb-title").textContent =
+    `${st.state === "loading" ? "Loading" : "Unloading"} ${info ? info.title : "the model"} — ${p.label || "starting"}`;
+  b.querySelector(".pb-detail").textContent = p.detail || (info ? info.details : "");
+  setBar(b.querySelector(".pbar"), p.fraction);
+  if (st.loading_seconds != null) b.querySelector(".pb-time").textContent = `${Math.round(st.loading_seconds)} s`;
+}
+
+function setBar(bar, fraction) {
+  const span = bar.querySelector("span");
+  if (fraction == null) {
+    bar.classList.add("indeterminate");
+    span.style.width = "";
+  } else {
+    bar.classList.remove("indeterminate");
+    span.style.width = `${Math.max(2, Math.min(100, fraction * 100)).toFixed(1)}%`;
+  }
+}
+
 function showBanner(text, err = false, action = null) {
   const b = $("#banner");
   b.hidden = false;
+  b.classList.remove("progress-banner");
   b.classList.toggle("err", err);
   b.innerHTML = "";
   const s = document.createElement("span");
@@ -124,7 +158,7 @@ function prettyModel(n) {
   if (!n) return "No Model";
   const m = /dino-(\d+)-(\w+)/.exec(n);
   if (!m) return n;
-  return `${m[1] === "768" ? "Accurate" : m[1] === "576" ? "Fast" : m[1]} · ${m[1]} px · ${m[2]}`;
+  return `Grounding DINO Base · ${m[1] === "768" ? "Accurate" : m[1] === "576" ? "Fast" : ""} ${m[1]} px · ${m[2]}`;
 }
 
 // --------------------------------------------------------------------- prompt
@@ -559,7 +593,9 @@ async function refreshModels() {
     return;
   }
   renderModels(cat);
-  const busy = cat.models.some((m) => m.state === "downloading") || (S.status && S.status.state === "loading");
+  await refreshStatus();
+  const busy = cat.models.some((m) => m.state === "downloading") ||
+    (S.status && (S.status.state === "loading" || S.status.state === "unloading"));
   refreshModels.t = setTimeout(refreshModels, busy ? 900 : 5000);
 }
 
@@ -579,15 +615,19 @@ function renderModels(cat) {
 function modelRow(m) {
   const el = document.createElement("div");
   el.className = "model" + (m.loaded ? " loaded" : "");
+  const st = S.status || {};
+  const busyHere = st.model === m.name && (st.state === "loading" || st.state === "unloading");
   const tags = [];
-  if (m.loaded) tags.push('<span class="tag live">Loaded</span>');
+  if (busyHere) tags.push(`<span class="tag live">${st.state === "loading" ? "Loading" : "Unloading"}</span>`);
+  else if (m.loaded) tags.push('<span class="tag live">Loaded</span>');
   if (m.state === "on_board") tags.push('<span class="tag on">On Board</span>');
   if (m.verified === true) tags.push('<span class="tag on">Verified</span>');
   if (m.verified === false) tags.push('<span class="tag" style="color:var(--err)">Damaged</span>');
   el.innerHTML = `<div class="name"></div><div class="meta"></div><div class="actions"></div>`;
   el.querySelector(".name").innerHTML = `<span></span>${tags.join("")}`;
   el.querySelector(".name span").textContent = m.title;
-  const meta = [m.kind === "text" ? "Shared by every detector" : `${m.size} px input`, m.precision, fmtBytes(m.bytes)];
+  const meta = [m.details, fmtBytes(m.bytes)];
+  if (m.kind === "text") meta.push("shared by every detector");
   if (m.latency_ms) meta.push(`~${Math.round(m.latency_ms)} ms per image`);
   if (m.kind === "detector" && m.requires && !m.requires_present) meta.push("needs the text encoder");
   el.querySelector(".meta").textContent = meta.filter(Boolean).join(" · ") + (m.about ? ` — ${m.about}` : "");
@@ -600,7 +640,20 @@ function modelRow(m) {
     act.append(b);
     return b;
   };
-  if (m.state === "downloading") {
+  if (busyHere) {
+    const p = st.progress || {};
+    const b = document.createElement("button");
+    b.className = "btn";
+    b.disabled = true;
+    b.innerHTML = `<span class="spinner"></span>${st.state === "loading" ? "Loading…" : "Unloading…"}`;
+    act.append(b);
+    const pr = document.createElement("div");
+    pr.className = "prog";
+    pr.innerHTML = `<div class="pbar"><span></span></div><div class="txt"></div>`;
+    setBar(pr.querySelector(".pbar"), p.fraction);
+    pr.querySelector(".txt").textContent = [p.label, p.detail].filter(Boolean).join(" · ");
+    el.append(pr);
+  } else if (m.state === "downloading") {
     btn("Cancel", "close", () => modelAction("cancel", m.name));
   } else if (m.state === "available") {
     btn(m.partial_bytes ? "Resume" : "Download", "download", () => modelAction("download", m.name), "primary");
@@ -639,7 +692,7 @@ async function modelAction(action, name) {
   try {
     const r = await post(`/api/models/${action}`, { name });
     if (action === "verify") toast(r.ok ? "Every file matches its checksum." : "Some files are damaged; re-download the model.", !r.ok);
-    if (action === "load") toast(`Loading ${prettyModel(name)}…`);
+    if (action === "load" || action === "unload") refreshStatus();
     refreshStatus();
   } catch (e) {
     toast(e.message, true);

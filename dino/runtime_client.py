@@ -63,12 +63,14 @@ class Detections:
 
 class DinoRuntime:
     def __init__(self, binary: str | Path, bundle: str | Path, text_bundle: str | Path,
-                 env: dict | None = None, ready_timeout: float = 180.0, log=None):
+                 env: dict | None = None, ready_timeout: float = 180.0, log=None, progress=None):
         self.bundle, self.text_bundle = Path(bundle), Path(text_bundle)
         self.manifest = json.loads((self.bundle / "manifest.json").read_text())
         self.size = int(self.manifest["size"])
         self.log_lines: deque[str] = deque(maxlen=400)
         self._log = log or (lambda s: None)
+        self._progress = progress                  # progress(done, total, stage) while loading
+        self.load_progress = (0, 0, "")
         self._lock = threading.Lock()
         e = dict(os.environ)
         e.setdefault("OMP_NUM_THREADS", "16")
@@ -102,6 +104,12 @@ class DinoRuntime:
                 s = line.decode("utf-8", "replace")
                 if s.strip() == "DINOREADY":
                     self._ready.set()
+                    continue
+                if s.startswith("DINOLOAD "):
+                    _, done, total, name = s.split(" ", 3)
+                    self.load_progress = (int(done), int(total), name)
+                    if self._progress:
+                        self._progress(int(done), int(total), name)
                     continue
                 self.log_lines.append(s)
                 self._log(s)

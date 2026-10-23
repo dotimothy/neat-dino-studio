@@ -50,7 +50,7 @@
       <img class="brand-mark" src="/static/assets/neat-dino.svg" alt="" width="36" height="36">
       <span class="brand-text">
         <span class="brand-title"><span class="brand-neat">Neat </span>DINO Studio</span>
-        <span class="brand-sub">Open-Vocabulary Detection · Grounding DINO on the Modalix MLA</span>
+        <span class="brand-sub">Open-Vocabulary Detection · Grounding DINO Base on the Modalix MLA</span>
       </span>
     </a>
     <div class="header-right">
@@ -125,6 +125,7 @@
 
       <section class="card results-card">
         <div class="card-head"><h2>Detections</h2><span class="muted small" id="det-count"></span></div>
+        <div class="det-model" id="det-model"></div>
         <div class="legend" id="legend"></div>
         <ol class="det-list" id="det-list"><li class="empty">Nothing yet.</li></ol>
       </section>
@@ -171,6 +172,9 @@
           on the SiMa.ai Modalix MLA. The network is compiled into 21 MLA programs; between them the board's CPU does the
           deformable-attention sampling, the top-900 query selection and the box updates.</p>
         <p class="muted small" id="about-status"></p>
+        <p class="muted small">Model: <a href="https://huggingface.co/IDEA-Research/grounding-dino-base" target="_blank" rel="noopener">IDEA-Research/grounding-dino-base</a>
+          — Swin-B image backbone, BERT Base text encoder, 6-layer deformable encoder and decoder, 900 queries, 232 M parameters,
+          compiled to bf16. Fast runs it at 576×576 px, Accurate at 768×768 px (letterboxed).</p>
         <p class="muted small">Grounding DINO © IDEA Research, Apache-2.0. This app is Apache-2.0.</p>
       </section>
     </div>

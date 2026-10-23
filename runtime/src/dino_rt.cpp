@@ -235,7 +235,15 @@ class Detector {
           {span(*dpost_out_, 0, 2 * NQ)});
     }
     auto t = Clock::now();
-    for (auto& [n, s] : stages_) s->model->load();
+    // Progress lines for the app's loading bar: "DINOLOAD <done> <total> <stage>".
+    size_t done = 0;
+    for (auto& [n, s] : stages_) {
+      std::fprintf(stderr, "DINOLOAD %zu %zu %s\n", done, stages_.size(), n.c_str());
+      std::fflush(stderr);
+      s->model->load();
+      ++done;
+    }
+    std::fprintf(stderr, "DINOLOAD %zu %zu done\n", done, stages_.size());
     std::fprintf(stderr, "dino_rt: S=%d N=%zu, %zu stages loaded in %.0f ms\n", S_, N_, stages_.size(), ms_since(t));
   }
 

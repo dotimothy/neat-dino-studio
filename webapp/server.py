@@ -64,6 +64,58 @@ class StudioError(Exception):
     pass
 
 
+UPSTREAM = "IDEA-Research/grounding-dino-base"
+FAMILY = "Grounding DINO Base"
+SPEED = {576: "Fast", 768: "Accurate"}
+
+
+def model_info(name: str | None, manifest: dict | None = None) -> dict | None:
+    """What exactly a model is, for the page: names, sizes, how it runs."""
+    if not name:
+        return None
+    m = manifest or {}
+    size = m.get("size")
+    if size is None:
+        g = re.search(r"-(\d{3})-", name)
+        size = int(g.group(1)) if g else None
+    prec = m.get("precision") or (name.rsplit("-", 1)[-1] if "-" in name else "bf16")
+    if m.get("kind") == "text" or "text" in name:
+        return {"name": name, "kind": "text", "title": f"{FAMILY} · Text Encoder (BERT Base)",
+                "short": "Text Encoder", "precision": prec, "upstream": UPSTREAM,
+                "details": f"BERT Base (110 M parameters) + projection · 64 text tokens · {prec} · 1 MLA program"}
+    programs = len(m.get("stages", [])) + sum(1 for st in m.get("backbone", []) if st.get("op") == "run")
+    speed = SPEED.get(size, "")
+    return {"name": name, "kind": "detector", "size": size, "precision": prec, "upstream": UPSTREAM,
+            "title": f"{FAMILY} · {speed} {size} px · {prec}".replace("  ", " "),
+            "short": f"DINO-B {size}",
+            "details": f"{UPSTREAM} · Swin-B + BERT Base, 232 M parameters · {size}×{size} input · {prec}"
+                       + (f" · {programs} MLA programs + text encoder" if programs else "")}
+
+
+def stage_label(stage: str) -> str:
+    """dino_rt stage name -> words for the loading bar."""
+    m = re.fullmatch(r"bb_s(\d)_b(\d+)", stage)
+    if m:
+        return f"Swin backbone · stage {m.group(1)} block {int(m.group(2)) + 1}"
+    m = re.fullmatch(r"bb_proj(\d)", stage)
+    if m:
+        return f"Backbone → feature level {m.group(1)}"
+    if stage == "bb_level23":
+        return "Backbone → feature levels 2–3"
+    m = re.fullmatch(r"enc(\d)", stage)
+    if m:
+        k = int(m.group(1))
+        return f"Encoder layer {k + 1}" if k < 6 else "Encoder output + query selection head"
+    if stage == "dec_values":
+        return "Decoder value maps"
+    m = re.fullmatch(r"dec_(pre|post)(\d)", stage)
+    if m:
+        return f"Decoder layer {int(m.group(2)) + 1} · " + ("attention" if m.group(1) == "pre" else "feed-forward + box head")
+    if stage == "text":
+        return "Text encoder (BERT Base)"
+    return stage
+
+
 def log(msg: str) -> None:
     print(f"[{time.strftime('%H:%M:%S')}] {msg}", flush=True)
 
@@ -341,6 +393,7 @@ class Studio:
         self.error: str | None = None
         self.load_started = 0.0
         self.load_seconds: float | None = None
+        self.progress = {"done": 0, "total": 0, "stage": ""}
         self.last_image: str | None = None
         self.last_ms: float | None = None
         self.assist = NullAssist()
@@ -364,8 +417,9 @@ class Studio:
             if job and job["name"] == n:
                 state = "downloading"
             mark = self._verified.get(n)
+            info = model_info(n, m or e)
             out.append({
-                "name": n, "kind": kind, "title": (e or {}).get("title") or self._title(meta, n),
+                "name": n, "kind": kind, "title": info["title"], "short": info["short"], "details": info["details"],
                 "about": (e or {}).get("about", ""), "size": meta.get("size"), "precision": meta.get("precision"),
                 "latency_ms": (e or {}).get("latency_ms"), "requires": requires,
                 "requires_present": (requires in local) if requires else True,
@@ -392,7 +446,25 @@ class Studio:
 
     def status(self) -> dict:
         b = self.backend
+        prog = None
+        if self.state in ("loading", "unloading"):
+            d, t, st = self.progress["done"], self.progress["total"], self.progress["stage"]
+            labels = {"release": "Unloading the previous model", "unload": "Unloading",
+                      "load": "Starting the MLA runtime", "warm": "Warming up (first detection)"}
+            label = labels.get(self.stage, self.stage or "")
+            if self.stage == "load" and t:
+                label = f"Loading MLA program {min(d + 1, t)} of {t}"
+            # load is ~90 % of the time; release and warm-up take the ends of the bar
+            frac = {"release": 0.02, "unload": None, "warm": 0.95}.get(self.stage)
+            if self.stage == "load":
+                frac = 0.05 + 0.88 * (d / t) if t else 0.05
+            prog = {"step": self.stage, "label": label, "detail": stage_label(st) if st and st != "done" else "",
+                    "done": d, "total": t, "fraction": frac}
+        info = None
+        if self.model:
+            info = model_info(self.model, read_bundle(self.models_dir / self.model) or {})
         return {"app": APP_ID, "version": VERSION, "state": self.state, "model": self.model, "stage": self.stage,
+                "model_info": info, "progress": prog,
                 "error": self.error, "backend": self.args.backend, "size": b.size if b else None,
                 "loading_seconds": round(time.time() - self.load_started, 1) if self.state == "loading" else None,
                 "load_seconds": self.load_seconds, "last_ms": self.last_ms,
@@ -418,6 +490,7 @@ class Studio:
                 if req and req not in local:
                     raise StudioError(f"{name} needs {req}; download it first")
             self.state, self.stage, self.error = "loading", "release", None
+            self.progress = {"done": 0, "total": 0, "stage": ""}
             self.load_started = time.time()
             previous = self.model
             self.model = name
@@ -452,24 +525,42 @@ class Studio:
     def _make_backend(self, name: str) -> backends.Backend:
         kind = self.args.backend
         if kind == "fake":
+            # walk through the same progress steps as the board, quickly
+            total = 49
+            for i in range(total):
+                self.progress = {"done": i, "total": total, "stage": f"bb_s{1 + i // 13}_b{i % 13}"}
+                time.sleep(getattr(self.args, "fake_load_seconds", 0.0) / total)
+            self.progress = {"done": total, "total": total, "stage": "done"}
             return backends.FakeBackend(int(re.search(r"(\d{3})", name).group(1)) if re.search(r"\d{3}", name) else 576)
         if kind == "torch":
             size = int(re.search(r"(\d{3})", name).group(1)) if re.search(r"\d{3}", name) else 576
             return backends.TorchBackend(size)
         m = read_bundle(self.models_dir / name)
         text = self.models_dir / m.get("requires", "dino-text-t64-bf16")
-        return backends.RuntimeBackend(self.args.runtime, self.models_dir / name, text,
-                                       log=lambda s: log(f"  dino_rt: {s}"))
 
-    def unload(self, who: str = "") -> None:
+        def progress(done, total, stage):
+            self.progress = {"done": done, "total": total, "stage": stage}
+        return backends.RuntimeBackend(self.args.runtime, self.models_dir / name, text,
+                                       log=lambda s: log(f"  dino_rt: {s}"), progress=progress)
+
+    def unload(self, who: str = "", wait: bool = False) -> None:
         with self.lock:
-            if self.state == "loading":
-                raise StudioError("a model is loading; wait for it")
-            if self.backend is not None:
-                self.backend.close()
+            if self.state in ("loading", "unloading"):
+                raise StudioError("a model is loading or unloading; wait for it")
             self._record(f"unload {self.model}", who)
-            self.backend, self.model, self.state, self.stage, self.error = None, None, "empty", None, None
-            self.last_image = None
+            self.state, self.stage = "unloading", "unload"
+            self.progress = {"done": 0, "total": 0, "stage": ""}
+
+        def work():
+            with self.lock:
+                if self.backend is not None:
+                    self.backend.close()        # SIGTERM to dino_rt: it frees the MLA
+                self.backend, self.model, self.state, self.stage, self.error = None, None, "empty", None, None
+                self.last_image = None
+        t = threading.Thread(target=work, name="model-unload", daemon=True)
+        t.start()
+        if wait:
+            t.join()
 
     def delete(self, name: str, who: str = "") -> None:
         with self.lock:
@@ -630,7 +721,7 @@ def create_app(studio: Studio) -> Flask:
             if action == "load":
                 studio.load(name, who())
             elif action == "unload":
-                studio.unload(who())
+                studio.unload(who(), wait=bool((request.get_json(silent=True) or {}).get("wait")))
             elif action == "delete":
                 studio.delete(name, who())
             elif action == "verify":
@@ -777,6 +868,7 @@ def main() -> int:
     ap.add_argument("--models", default=str(default_models_dir()))
     ap.add_argument("--backend", default="mla", choices=["mla", "torch", "fake"],
                     help="mla on the board; torch (GPU) or fake to try the page on a PC")
+    ap.add_argument("--fake-load-seconds", type=float, default=0.0, help=argparse.SUPPRESS)
     ap.add_argument("--runtime", default=os.environ.get("DINO_RT") or str(ROOT / "runtime/build/dino_rt"))
     ap.add_argument("--hub-repo", default=HUB_REPO)
     ap.add_argument("--list-hub", action="store_true")
