@@ -63,6 +63,46 @@ the same hops would cost seconds (EV74 tessellation of 1×N token tensors: 5 s p
 | 768 encoders "Check FAILED" | channel softmax over 12 240 channels | exp/sum over two token chunks (exact; scores in −25..15) |
 | "Layer names are not unique" | two identical constants merged by onnxsim | unequal chunk sizes |
 
+## Live mode: two frames in flight
+
+One frame at a time leaves the MLA idle while the CPU samples (112 ms of the 330 ms at 576) and
+the CPU idle while the MLA runs. `dino_rt` now has two slots: each has its own device buffers,
+bound to the same loaded programs (SimaLMM keys programs by ELF path, so loading one twice costs
+nothing). The client sends the next frame before the last reply; replies come back in order.
+An arbiter gives the MLA to the older frame first, and the CPU threads are split between the
+slots that are sampling at that moment.
+
+| Board, `tools/pipe_bench.py` | One at a time | Two in flight | Per-frame latency |
+|---|---|---|---|
+| 576 | 3.05 FPS (328 ms) | **3.88 FPS** (258 ms) | 0.33 → 0.50 s |
+| 768 | 1.84 FPS (544 ms) | **2.34 FPS** (427 ms) | 0.54 → 0.83 s |
+| 768, whole web app (HTTPS, JPEG decode, post-processing) | 1.53 FPS | **2.19 FPS** | |
+
+Results are bit-identical to one at a time (checked with two alternating images). The gain is
+capped by contention, not by idle hardware: a timeline (`DINO_TRACE=file`) shows the MLA busy
+71 % of the time. MLA programs run ~10 % slower while the other slot's NEON sampling runs (both
+share DRAM bandwidth), sampling with 8 threads takes 24 ms vs 17 ms with 16 (the A65 has 8
+cores × 2 threads), and the older frame waits ~12 ms behind long backbone programs. Back-to-back
+programs are not queued in this mode, so the older frame can take the MLA between them.
+
+## Voice prompts
+
+Whisper Small (a16w8) and Gemma 4 E2B (a16w4) run in a sidecar process through pyneat's
+GenAIServer (LLiMa), next to `dino_rt` on the MLA. On the board, the whole path
+(record → transcribe → phrases) takes ~0.5 s: Whisper 0.28 s for a 3 s clip, the LLM 0.15–0.3 s.
+On eight test requests Gemma 4 E2B gave the right phrases for all, including indirect ones
+("is there anything I could sit on" → `chair . sofa . bench . stool .`); LFM2.5 230M answers in
+~40 ms but replied "none" to that one. Loading takes ~15–20 s.
+
+Two things matter when several MLA apps share the board:
+
+- **One process loads at a time.** A process that connects to the MLA dispatcher while another
+  is loading programs fails ("Unable to connect to the server from dispatcher", or
+  `MLA_LOAD_FAILED`). The studio serialises its own loads (detector and voice); other apps can
+  still collide with it.
+- **Page cache sits in CMA.** After copying large model files, CmaFree dropped to ~400 MB and
+  `dino_rt` could not allocate its buffers; `sync; echo 1 > /proc/sys/vm/drop_caches` freed 1.1 GB.
+
 ## Reproduce
 
 ```

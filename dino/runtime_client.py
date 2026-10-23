@@ -14,6 +14,7 @@ import subprocess
 import threading
 import time
 from collections import deque
+from concurrent.futures import Future
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -23,7 +24,7 @@ from dino import prompt as P
 
 T, NQ, TPW, D = 64, 900, 193, 256
 TIMING_KEYS = ["patchify", "backbone", "encoder_mla", "encoder_cpu", "dec_values", "topk", "decoder_mla",
-               "decoder_cpu", "total", "backbone_cpu"]
+               "decoder_cpu", "total", "backbone_cpu", "slot"]
 
 
 class RuntimeError_(RuntimeError):
@@ -91,6 +92,11 @@ class DinoRuntime:
                 raise RuntimeError_("dino_rt did not become ready in time")
         self.load_seconds = time.time() - t0
         self.prompt: P.Prompt | None = None
+        # Replies come back in request order, so the reader resolves the oldest pending future.
+        self._pending: deque[Future] = deque()
+        self._out_thread = threading.Thread(target=self._read_replies, daemon=True)
+        self._out_thread.start()
+        self.slots = int(self.info().get("slots", 1))
 
     def _read_stderr(self):
         buf = b""
@@ -114,20 +120,46 @@ class DinoRuntime:
                 self.log_lines.append(s)
                 self._log(s)
 
-    def _call(self, cmd: int, payload: bytes = b"") -> bytes:
+    def _send(self, cmd: int, payload: bytes = b"") -> Future:
+        """Queue a request; the future resolves to the reply body (or raises RuntimeError_)."""
+        fut: Future = Future()
         with self._lock:
             if self.proc.poll() is not None:
                 raise RuntimeError_("dino_rt is not running")
-            self.proc.stdin.write(b"DINO" + struct.pack("<II", cmd, len(payload)) + payload)
-            self.proc.stdin.flush()
-            head = self._read(12)
-            if head[:4] != b"DINO":
-                raise RuntimeError_("bad reply from dino_rt")
-            status, n = struct.unpack("<II", head[4:])
-            body = self._read(n)
-        if status:
-            raise RuntimeError_(body.decode("utf-8", "replace"))
-        return body
+            self._pending.append(fut)
+            try:
+                self.proc.stdin.write(b"DINO" + struct.pack("<II", cmd, len(payload)) + payload)
+                self.proc.stdin.flush()
+            except OSError as e:
+                self._pending.remove(fut)
+                raise RuntimeError_(f"dino_rt is not running ({e})") from e
+        return fut
+
+    def _call(self, cmd: int, payload: bytes = b"") -> bytes:
+        return self._send(cmd, payload).result()
+
+    def _read_replies(self):
+        err = None
+        try:
+            while True:
+                head = self._read(12)
+                if head[:4] != b"DINO":
+                    raise RuntimeError_("bad reply from dino_rt")
+                status, n = struct.unpack("<II", head[4:])
+                body = self._read(n)
+                with self._lock:
+                    fut = self._pending.popleft() if self._pending else None
+                if fut is None:
+                    continue
+                if status:
+                    fut.set_exception(RuntimeError_(body.decode("utf-8", "replace")))
+                else:
+                    fut.set_result(body)
+        except Exception as e:  # noqa: BLE001  (process gone: fail whatever is still waiting)
+            err = e
+        with self._lock:
+            while self._pending:
+                self._pending.popleft().set_exception(RuntimeError_(str(err) or "dino_rt stopped"))
 
     def _read(self, n: int) -> bytes:
         out = bytearray()
@@ -146,15 +178,24 @@ class DinoRuntime:
         return struct.unpack("<f", self._call(2, payload))[0]
 
     def detect(self, rgb_square: np.ndarray, valid_w: int, valid_h: int) -> Detections:
+        return self.detect_async(rgb_square, valid_w, valid_h).result()
+
+    def detect_async(self, rgb_square: np.ndarray, valid_w: int, valid_h: int) -> Future:
+        """Send a frame without waiting: with two runtime slots, two frames are in flight
+        (one on the MLA while the other's sampling runs on the CPU). Resolves to Detections."""
         S = self.size
         if rgb_square.shape != (S, S, 3) or rgb_square.dtype != np.uint8:
             raise ValueError(f"expected ({S},{S},3) uint8, got {rgb_square.shape} {rgb_square.dtype}")
-        body = self._call(3, struct.pack("<II", valid_w, valid_h) + np.ascontiguousarray(rgb_square).tobytes())
-        f = np.frombuffer(body, np.float32)
-        logits = f[: NQ * T].reshape(NQ, T).copy()
-        boxes = f[NQ * T: NQ * T + NQ * 4].reshape(NQ, 4).copy()
-        tm = f[NQ * T + NQ * 4:]
-        return Detections(logits, boxes, {k: float(tm[i]) for i, k in enumerate(TIMING_KEYS)})
+        raw = self._send(3, struct.pack("<II", valid_w, valid_h) + np.ascontiguousarray(rgb_square).tobytes())
+        out: Future = Future()
+
+        def done(f: Future):
+            try:
+                out.set_result(self._detections(f.result()))
+            except Exception as e:  # noqa: BLE001
+                out.set_exception(e)
+        raw.add_done_callback(done)
+        return out
 
     def detect_cached(self) -> Detections:
         """Rerun on the last image (its backbone output is still on the device)."""
@@ -169,20 +210,13 @@ class DinoRuntime:
 
     def detect_tokens(self, tokens: np.ndarray) -> Detections:
         """Debug: run everything after the backbone on given (N, 256) backbone tokens."""
-        body = self._call(5, np.ascontiguousarray(tokens, np.float32).tobytes())
-        f = np.frombuffer(body, np.float32)
-        logits = f[: NQ * T].reshape(NQ, T).copy()
-        boxes = f[NQ * T: NQ * T + NQ * 4].reshape(NQ, 4).copy()
-        tm = f[NQ * T + NQ * 4:]
-        return Detections(logits, boxes, {k: float(tm[i]) for i, k in enumerate(TIMING_KEYS)})
+        return self._detections(self._call(5, np.ascontiguousarray(tokens, np.float32).tobytes()))
 
     def close(self, timeout: float = 20.0):
         if self.proc.poll() is None:
             try:
-                with self._lock:
-                    self.proc.stdin.write(b"DINO" + struct.pack("<II", 4, 0))
-                    self.proc.stdin.flush()
-            except OSError:
+                self._send(4).result(timeout)        # after every frame still in flight
+            except Exception:  # noqa: BLE001
                 pass
             try:
                 self.proc.wait(timeout)

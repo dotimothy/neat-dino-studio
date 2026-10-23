@@ -66,7 +66,7 @@ async function refreshStatus() {
   }
   renderStatus();
   clearTimeout(refreshStatus.t);
-  const loading = S.status && S.status.state === "loading";
+  const loading = S.status && (S.status.state === "loading" || (S.status.voice && S.status.voice.state === "loading"));
   refreshStatus.t = setTimeout(refreshStatus, loading ? 800 : 4000);
 }
 
@@ -106,6 +106,7 @@ function renderStatus() {
   }
   $("#about-status").textContent = `Server ${st.version}, backend ${st.backend}` + (st.size ? `, input ${st.size} px` : "") +
     (st.load_seconds ? `, loaded in ${st.load_seconds} s` : "");
+  renderVoice();
 }
 
 // Model loading / unloading: what is happening, with a bar that moves.
@@ -312,6 +313,18 @@ async function detect(opts = {}) {
   else fd.append("image_id", S.imageId);
   try {
     const r = await api("/api/detect", { method: "POST", body: fd });
+    if (opts.live) {
+      // two frames are in flight: show results in order, drop any that arrive late
+      if (!S.live || opts.seq < S.liveShown) return;
+      S.liveShown = opts.seq;
+      const now = performance.now();
+      S.fps.push(now - S.lastShownT);
+      S.lastShownT = now;
+      if (S.fps.length > 10) S.fps.shift();
+      const avg = S.fps.reduce((a, b) => a + b, 0) / S.fps.length;
+      $("#fps").textContent = `${(1000 / avg).toFixed(1)} FPS`;
+      $("#fps").title = `${Math.round(avg)} ms between results, ${Math.round(r.timing.server_total)} ms per frame on the board`;
+    }
     S.result = r;
     if (!S.cam) S.imageId = r.image_id;
     if (!opts.live) remember(text);
@@ -543,16 +556,25 @@ async function snapshot() {
   detect();
 }
 
+// Keep as many frames in flight as the runtime runs at once (two on the board: one on the
+// MLA while the CPU samples the other); the newest result wins.
 async function liveLoop() {
+  const inflight = new Set();
+  let seq = 0;
+  S.liveShown = -1;
+  S.lastShownT = performance.now();
   while (S.live && S.cam) {
-    const t0 = performance.now();
-    await detect({ live: true, blob: await grabFrame() });
-    const dt = performance.now() - t0;
-    S.fps.push(dt);
-    if (S.fps.length > 10) S.fps.shift();
-    const avg = S.fps.reduce((a, b) => a + b, 0) / S.fps.length;
-    $("#fps").textContent = `${(1000 / avg).toFixed(1)} FPS · ${Math.round(avg)} ms`;
+    const depth = Math.max(1, Math.min(2, (S.status && S.status.pipeline) || 1));
+    if (inflight.size >= depth) {
+      await Promise.race(inflight);
+      continue;
+    }
+    const blob = await grabFrame();
+    if (!S.live) break;
+    const p = detect({ live: true, blob, seq: seq++ }).finally(() => inflight.delete(p));
+    inflight.add(p);
   }
+  await Promise.allSettled(inflight);
 }
 function startLive() {
   if (!S.status || S.status.state !== "ready") return toast("Load a model first (Settings → Models).", true);
@@ -562,6 +584,7 @@ function startLive() {
   $("#live-btn").classList.add("on");
   $("#live-btn span").textContent = "Stop Live";
   $("#fps").hidden = false;
+  $("#fps").textContent = "…";
   liveLoop();
 }
 function stopLive(why) {
@@ -571,6 +594,174 @@ function stopLive(why) {
   $("#live-btn span").textContent = "Go Live";
   $("#fps").hidden = true;
   if (why) toast(why, true);
+}
+
+// --------------------------------------------------------------------- voice
+const V = { rec: null, stream: null, chunks: [], t0: 0, held: 0, timer: null, ctx: null, key: "" };
+const MAX_REC_S = 15;
+
+function voiceLine(html, cls = "") {
+  const el = $("#voice-line");
+  el.hidden = !html;
+  el.className = "voice-line" + (cls ? " " + cls : "");
+  el.innerHTML = html || "";
+}
+const esc = (t) => String(t).replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+
+async function micDown(e) {
+  if (e) e.preventDefault();
+  if (V.rec) return stopRec();                 // click-to-talk: the second click stops
+  if (V.busy) return;
+  const vs = S.status && S.status.voice;
+  if (!vs || vs.state !== "ready") {
+    if (vs && vs.state === "loading") return toast("Voice is still loading…");
+    if (!vs || !vs.can_start) return openSettings("voice");
+    if (await confirmBox("Turn on voice? This loads Whisper and a small LLM on the MLA (a few seconds), next to the detector.", "Turn On"))
+      startVoice();
+    return;
+  }
+  await startRec();
+  V.held = performance.now();
+}
+function micUp() {
+  // held for a while = push-to-talk (release stops); a quick click keeps recording until the next click
+  if (V.rec && performance.now() - V.held > 400) stopRec();
+}
+
+async function startRec() {
+  if (!navigator.mediaDevices || !window.MediaRecorder)
+    return toast("This browser can't record here. Open the studio over HTTPS.", true);
+  try {
+    V.stream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true } });
+  } catch (e) {
+    return toast("Microphone not available: " + e.message, true);
+  }
+  const mime = ["audio/webm;codecs=opus", "audio/ogg;codecs=opus", "audio/webm", "audio/mp4"].find((m) => MediaRecorder.isTypeSupported(m)) || "";
+  V.rec = new MediaRecorder(V.stream, mime ? { mimeType: mime } : {});
+  V.chunks = [];
+  V.rec.ondataavailable = (e) => { if (e.data.size) V.chunks.push(e.data); };
+  V.rec.onstop = sendRec;
+  V.rec.start();
+  V.t0 = performance.now();
+  $("#mic-btn").classList.add("rec");
+  $("#mic-btn .mic-t").textContent = "Stop";
+  voiceLine(`<span class="lvl"><span></span></span><span>Listening… <b class="secs">0.0</b> s</span>`);
+  let lvl = null;
+  try {
+    V.ctx = new AudioContext();
+    const an = V.ctx.createAnalyser();
+    an.fftSize = 512;
+    V.ctx.createMediaStreamSource(V.stream).connect(an);
+    const buf = new Uint8Array(an.fftSize);
+    lvl = () => {
+      an.getByteTimeDomainData(buf);
+      let m = 0;
+      for (const v of buf) m = Math.max(m, Math.abs(v - 128));
+      return Math.min(1, m / 64);
+    };
+  } catch (e) { /* no level meter */ }
+  V.timer = setInterval(() => {
+    const t = (performance.now() - V.t0) / 1000;
+    const sec = $("#voice-line .secs"), bar = $("#voice-line .lvl span");
+    if (sec) sec.textContent = t.toFixed(1);
+    if (bar && lvl) bar.style.width = `${Math.round(lvl() * 100)}%`;
+    if (t >= MAX_REC_S) stopRec();
+  }, 80);
+}
+
+function stopRec() {
+  if (!V.rec) return;
+  clearInterval(V.timer);
+  V.dur = (performance.now() - V.t0) / 1000;
+  try { V.rec.stop(); } catch (e) { /* already stopped */ }
+  V.stream.getTracks().forEach((t) => t.stop());
+  if (V.ctx) V.ctx.close().catch(() => {});
+  V.rec = V.stream = V.ctx = null;
+  $("#mic-btn").classList.remove("rec");
+  $("#mic-btn .mic-t").textContent = "Speak";
+}
+
+async function sendRec() {
+  if (V.dur < 0.4) return voiceLine("Too short. Hold Speak while you talk, or click once to start and again to stop.", "err");
+  const type = (V.chunks[0] && V.chunks[0].type) || "audio/webm";
+  const blob = new Blob(V.chunks, { type });
+  const ext = type.includes("ogg") ? "ogg" : type.includes("mp4") ? "m4a" : "webm";
+  const fd = new FormData();
+  fd.append("audio", blob, `speech.${ext}`);
+  V.busy = true;
+  $("#mic-btn").classList.add("wait");
+  voiceLine(`<span class="spinner"></span><span>Transcribing…</span>`);
+  try {
+    const r = await api("/api/voice/prompt", { method: "POST", body: fd });
+    const how = r.by === "llm" ? `${esc(S.status.voice.llm_title || "LLM")}` : "rules";
+    const ms = `${Math.round(r.timing.asr + r.timing.llm)} ms`;
+    if (!r.prompt) {
+      voiceLine(`Heard <span class="said">“${esc(r.transcript)}”</span> but nothing to find.`, "err");
+      return;
+    }
+    voiceLine(`<span class="said">“${esc(r.transcript)}”</span> → <span class="to">${esc(r.prompt)}</span>
+      <span class="muted small" title="Whisper ${Math.round(r.timing.asr)} ms, ${how} ${Math.round(r.timing.llm)} ms">${ms} · ${how}</span>`);
+    promptEl().value = r.prompt;
+    store.set("prompt", r.prompt);
+    parsePrompt();
+    if ($("#voice-autorun").checked && !S.live && (S.imageBlob || S.cam)) detect();
+  } catch (e) {
+    voiceLine(esc(e.message), "err");
+  } finally {
+    V.busy = false;
+    $("#mic-btn").classList.remove("wait");
+  }
+}
+
+async function startVoice() {
+  const sel = $("#voice-llm");
+  try {
+    await post("/api/voice/start", { llm: sel ? sel.value : null });
+    toast("Loading voice models…");
+  } catch (e) {
+    toast(e.message, true);
+  }
+  refreshStatus();
+}
+
+function renderVoice() {
+  const vs = S.status && S.status.voice;
+  const mic = $("#mic-btn");
+  if (!vs) return;
+  mic.classList.toggle("off", vs.state !== "ready");
+  mic.title = vs.state === "ready" ? "Speak what to find: hold to talk, or click to start and stop"
+    : vs.state === "loading" ? "Voice is loading…" : "Voice is off: click to turn it on";
+  const key = JSON.stringify([vs.state, vs.llm, vs.choices, vs.error, vs.can_start]);
+  const card = $("#voice-card");
+  const tm = card.querySelector(".v-time");
+  if (tm && vs.state === "loading" && vs.elapsed != null) tm.textContent = `${Math.round(vs.elapsed)} s`;
+  if (key === V.key) return;
+  V.key = key;
+  const tags = { ready: '<span class="tag on">On</span>', loading: '<span class="tag live">Loading</span>',
+    stopping: '<span class="tag live">Stopping</span>', error: '<span class="tag">Failed</span>', off: '<span class="tag">Off</span>' };
+  const opts = (vs.choices || []).map((n) => `<option value="${esc(n)}"${n === vs.llm ? " selected" : ""}>${esc(vs.titles[n] || n)}</option>`).join("");
+  const busy = vs.state === "loading" || vs.state === "stopping";
+  card.innerHTML = `<div class="model ${vs.state === "ready" ? "loaded" : ""}">
+    <div class="name">Whisper Small${vs.llm || vs.state === "off" ? " + LLM" : ""} ${tags[vs.state] || ""}</div>
+    <div class="meta"></div>
+    <div class="actions">
+      ${opts ? `<select id="voice-llm" title="LLM that turns requests into phrases"${vs.state !== "off" && vs.state !== "error" ? " disabled" : ""}>${opts}</select>` : ""}
+      ${vs.state === "ready" || busy ? `<button class="btn" id="voice-off"${busy ? " disabled" : ""}><svg><use href="#i-stop"/></svg>Turn Off</button>`
+        : `<button class="btn primary" id="voice-on"${vs.can_start ? "" : " disabled"}><svg><use href="#i-mic"/></svg>Turn On</button>`}
+    </div>
+    ${vs.state === "loading" ? '<div class="prog"><div class="pbar indeterminate"><span></span></div><div class="txt">Loading Whisper and the LLM on the MLA… <span class="v-time"></span></div></div>' : ""}
+    ${vs.error ? `<div class="err">${esc(vs.error)}</div>` : ""}
+  </div>`;
+  card.querySelector(".meta").textContent = !vs.can_start
+    ? "Needs pyneat and the LLiMa models (whisper-small-a16w8) in /media/nvme/llima/models."
+    : vs.state === "ready" ? `Whisper Small (a16w8)${vs.llm ? " · " + (vs.llm_title || vs.llm) : " · no LLM (rules)"} · loaded in ${vs.load_seconds} s`
+      : "Speech to text: Whisper Small (a16w8). Request to phrases: the LLM chosen here.";
+  const on = $("#voice-on"), off = $("#voice-off");
+  if (on) on.onclick = startVoice;
+  if (off) off.onclick = async () => {
+    try { await post("/api/voice/stop"); } catch (e) { toast(e.message, true); }
+    refreshStatus();
+  };
 }
 
 // --------------------------------------------------------------------- settings / models
@@ -768,6 +959,21 @@ function init() {
     }
   });
   $("#detect-btn").onclick = () => detect();
+  const mic = $("#mic-btn");
+  mic.addEventListener("pointerdown", micDown);
+  mic.addEventListener("pointerup", micUp);
+  mic.addEventListener("pointerleave", micUp);
+  mic.addEventListener("contextmenu", (e) => e.preventDefault());
+  const typing = (el) => el && (el.tagName === "TEXTAREA" || el.tagName === "INPUT" || el.tagName === "SELECT");
+  window.addEventListener("keydown", (e) => {
+    if (e.code === "Space" && !e.repeat && !typing(document.activeElement) && !$("#settings").open) micDown(e);
+  });
+  window.addEventListener("keyup", (e) => {
+    if (e.code === "Space" && V.rec && !typing(document.activeElement)) { e.preventDefault(); stopRec(); }
+  });
+  const ar = $("#voice-autorun");
+  ar.checked = store.get("voice-autorun", true);
+  ar.addEventListener("change", () => store.set("voice-autorun", ar.checked));
   $("#assist-btn").onclick = async () => {
     try {
       const r = await post("/api/prompt/assist", { text: promptEl().value });

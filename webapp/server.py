@@ -43,7 +43,8 @@ ROOT = Path(__file__).resolve().parent.parent
 WEB = Path(__file__).resolve().parent / "web"
 sys.path.insert(0, str(ROOT))
 from app import backends  # noqa: E402
-from app.assist import NullAssist  # noqa: E402
+from app.assist import NullAssist  # noqa: E402,F401  (the no-LLM assist, kept for tests)
+from app.voice import VoiceError, VoiceService  # noqa: E402
 from dino import postprocess  # noqa: E402
 from dino.letterbox import Letterbox  # noqa: E402
 
@@ -67,6 +68,7 @@ class StudioError(Exception):
 UPSTREAM = "IDEA-Research/grounding-dino-base"
 FAMILY = "Grounding DINO Base"
 SPEED = {576: "Fast", 768: "Accurate"}
+PREC_LABEL = {"bf16": "bf16", "w8a16": "int8 weights"}
 
 
 def model_info(name: str | None, manifest: dict | None = None) -> dict | None:
@@ -85,10 +87,12 @@ def model_info(name: str | None, manifest: dict | None = None) -> dict | None:
                 "details": f"BERT Base (110 M parameters) + projection · 64 text tokens · {prec} · 1 MLA program"}
     programs = len(m.get("stages", [])) + sum(1 for st in m.get("backbone", []) if st.get("op") == "run")
     speed = SPEED.get(size, "")
+    pl = PREC_LABEL.get(prec, prec)
+    how = {"w8a16": "int8 weights for the backbone and encoder, bf16 activations"}.get(prec, prec)
     return {"name": name, "kind": "detector", "size": size, "precision": prec, "upstream": UPSTREAM,
-            "title": f"{FAMILY} · {speed} {size} px · {prec}".replace("  ", " "),
-            "short": f"DINO-B {size}",
-            "details": f"{UPSTREAM} · Swin-B + BERT Base, 232 M parameters · {size}×{size} input · {prec}"
+            "title": f"{FAMILY} · {speed} {size} px · {pl}".replace("  ", " "),
+            "short": f"DINO-B {size}" + (" int8" if prec == "w8a16" else ""),
+            "details": f"{UPSTREAM} · Swin-B + BERT Base, 232 M parameters · {size}×{size} input · {how}"
                        + (f" · {programs} MLA programs + text encoder" if programs else "")}
 
 
@@ -97,10 +101,14 @@ def stage_label(stage: str) -> str:
     m = re.fullmatch(r"bb_s(\d)_b(\d+)", stage)
     if m:
         return f"Swin backbone · stage {m.group(1)} block {int(m.group(2)) + 1}"
-    m = re.fullmatch(r"bb_proj(\d)", stage)
+    m = re.fullmatch(r"bbm?_stage(\d)([abc]?)", stage)
+    if m:
+        part = {"a": " (blocks 1–6)", "b": " (blocks 7–12)", "c": " (blocks 13–18)"}.get(m.group(2), "")
+        return f"Swin backbone · stage {m.group(1)}{part}"
+    m = re.fullmatch(r"bbm?_proj(\d)", stage)
     if m:
         return f"Backbone → feature level {m.group(1)}"
-    if stage == "bb_level23":
+    if stage in ("bb_level23", "bbm_level23"):
         return "Backbone → feature levels 2–3"
     m = re.fullmatch(r"enc(\d)", stage)
     if m:
@@ -396,7 +404,13 @@ class Studio:
         self.progress = {"done": 0, "total": 0, "stage": ""}
         self.last_image: str | None = None
         self.last_ms: float | None = None
-        self.assist = NullAssist()
+        # Voice prompts (Whisper + an LLM on the MLA, in a sidecar); its LLM is also the prompt assist.
+        # one MLA client connects and loads at a time (detector or voice)
+        self.mla_load_lock = threading.Lock()
+        self.voice = VoiceService(models_dir=Path(getattr(args, "llima_models", "/media/nvme/llima/models")),
+                                  port=getattr(args, "voice_port", 9987), log=log, load_lock=self.mla_load_lock)
+        self.assist = self.voice
+        self.prefs_path = self.models_dir / ".studio.json"
         self.events: list[dict] = []
         self._verified: dict[str, tuple] = {}
 
@@ -469,7 +483,48 @@ class Studio:
                 "loading_seconds": round(time.time() - self.load_started, 1) if self.state == "loading" else None,
                 "load_seconds": self.load_seconds, "last_ms": self.last_ms,
                 "https": bool(getattr(self.args, "tls", False)), "port": self.args.port,
-                "assist": self.assist.describe(), "max_tokens": 64}
+                "assist": self.assist.describe(), "max_tokens": 64,
+                "pipeline": getattr(b, "slots", 1) if b else 1, "voice": self.voice.status()}
+
+    # ---- preferences that survive a restart (voice on/off)
+    def prefs(self) -> dict:
+        try:
+            return json.loads(self.prefs_path.read_text())
+        except (OSError, ValueError):
+            return {}
+
+    def _save_prefs(self, **kw) -> None:
+        p = {**self.prefs(), **kw}
+        try:
+            self.prefs_path.write_text(json.dumps(p))
+        except OSError as e:
+            log(f"could not save preferences: {e}")
+
+    # ---- voice
+    def voice_start(self, llm: str | None = None, who: str = "") -> None:
+        try:
+            self.voice.start(llm=llm)
+        except VoiceError as e:
+            raise StudioError(str(e)) from e
+        self._record(f"voice on ({self.voice.asr} + {self.voice.llm or 'no LLM'})", who)
+        self._save_prefs(voice=True, voice_llm=self.voice.llm)
+
+    def voice_stop(self, who: str = "") -> None:
+        self._record("voice off", who)
+        self._save_prefs(voice=False)
+        threading.Thread(target=self.voice.stop, name="voice-stop", daemon=True).start()
+
+    def voice_prompt(self, audio: bytes, filename: str, mime: str) -> dict:
+        """Speech -> transcript (Whisper) -> prompt (LLM, or rules when there is none)."""
+        try:
+            tr = self.voice.transcribe(audio, filename, mime)
+        except VoiceError as e:
+            raise StudioError(str(e)) from e
+        if not tr["text"] or (tr["no_speech"] > 0.6 and len(tr["text"]) < 4):
+            raise StudioError("Didn’t catch that. Hold the mic button and say what to find.")
+        pr = self.voice.to_prompt(tr["text"])
+        return {"transcript": tr["text"], "prompt": pr["prompt"], "by": pr["by"],
+                "timing": {"asr": tr["ms"], "llm": pr["ms"]}, "llm": self.voice.llm}
 
     # ---- loading
     def _record(self, what: str, who: str = "") -> None:
@@ -505,7 +560,8 @@ class Studio:
                     self.backend = None
                     time.sleep(0.5)               # never two detectors on the MLA at once
                 self.stage = "load"
-                b = self._make_backend(name)
+                with self.mla_load_lock:
+                    b = self._make_backend(name)
                 self.stage = "warm"
                 pr = b.build_prompt("object .")
                 b.set_prompt(pr)
@@ -602,46 +658,56 @@ class Studio:
         return None
 
     def detect(self, image_bytes: bytes | None, text: str, image_id: str | None, nms: float | None) -> dict:
+        """One detection. Decoding and post-processing run outside the lock, and the runtime
+        takes the next frame while this one is still running, so Live mode keeps two in flight."""
+        t0 = time.time()
+        same = image_bytes is None
+        dec_ms = 0.0
+        rgb = lb = None
+        if not same:
+            b = self.backend
+            if b is not None and self.state == "ready":
+                rgb, lb = self._letterbox(image_bytes, b.size)
+                dec_ms = (time.time() - t0) * 1e3
         with self.lock:
             if self.backend is None or self.state != "ready":
                 raise StudioError("No model is loaded. Open Settings → Models to load one.")
             b = self.backend
-            t0 = time.time()
-            text = self.assist.rewrite(text)              # LLiMa hook (does nothing today)
             pr = b.build_prompt(text)
             if not pr.phrases:
                 raise StudioError("Type at least one thing to find, e.g. “person . dog .”")
             text_ms = b.set_prompt(pr)
-            same = image_bytes is None
-            dec_ms = 0.0
             if same:
                 # Only the prompt changed: the backbone output of this image is still on the board.
                 if image_id is None or image_id != self.last_image:
                     raise StudioError("The image is gone from the board; send it again")
                 lb = self._last_lb
-                det = b.detect(None, lb.new_w, lb.new_h, same_image=True)
+                fut = b.detect_async(None, lb.new_w, lb.new_h, same_image=True)
             else:
-                t_dec = time.time()
-                rgb, lb = self._letterbox(image_bytes, b.size)
-                dec_ms = (time.time() - t_dec) * 1e3
-                det = b.detect(rgb, lb.new_w, lb.new_h)
+                if rgb is None or rgb.shape[0] != b.size:          # model changed meanwhile
+                    t_dec = time.time()
+                    rgb, lb = self._letterbox(image_bytes, b.size)
+                    dec_ms = (time.time() - t_dec) * 1e3
+                fut = b.detect_async(rgb, lb.new_w, lb.new_h)
                 self.last_image = hashlib.sha1(image_bytes).hexdigest()[:16]
                 self._last_lb = lb
-            cands = postprocess.candidates(det.logits, det.boxes, pr, lb, floor=0.05, nms_iou=nms)
-            total = (time.time() - t0) * 1e3
-            self.last_ms = round(total, 1)
-            timing = {k: round(v, 1) for k, v in det.timing.items() if v}
-            timing["text"] = round(text_ms, 1)
-            if not same:
-                timing["decode"] = round(dec_ms, 1)
-            timing["postprocess"] = round((time.time() - t0) * 1e3 - sum(
-                v for k, v in timing.items() if k in ("total", "text", "decode")), 1)
-            timing["server_total"] = round(total, 1)
-            return {"model": self.model, "size": b.size, "image_id": self.last_image,
-                    "width": lb.width, "height": lb.height, "caption": pr.caption,
-                    "phrases": [{"text": p, "color": PALETTE[i % len(PALETTE)]} for i, p in enumerate(pr.phrases)],
-                    "truncated": pr.truncated, "tokens": pr.n_tokens, "detections": cands, "timing": timing,
-                    "same_image": same}
+            model, image_ref = self.model, self.last_image
+        det = fut.result()
+        cands = postprocess.candidates(det.logits, det.boxes, pr, lb, floor=0.05, nms_iou=nms)
+        total = (time.time() - t0) * 1e3
+        self.last_ms = round(total, 1)
+        timing = {k: round(v, 1) for k, v in det.timing.items() if v and k != "slot"}
+        timing["text"] = round(text_ms, 1)
+        if not same:
+            timing["decode"] = round(dec_ms, 1)
+        timing["postprocess"] = round((time.time() - t0) * 1e3 - sum(
+            v for k, v in timing.items() if k in ("total", "text", "decode")), 1)
+        timing["server_total"] = round(total, 1)
+        return {"model": model, "size": b.size, "image_id": image_ref,
+                "width": lb.width, "height": lb.height, "caption": pr.caption,
+                "phrases": [{"text": p, "color": PALETTE[i % len(PALETTE)]} for i, p in enumerate(pr.phrases)],
+                "truncated": pr.truncated, "tokens": pr.n_tokens, "detections": cands, "timing": timing,
+                "same_image": same}
 
     @staticmethod
     def _letterbox(data: bytes, size: int) -> tuple[np.ndarray, Letterbox]:
@@ -680,6 +746,7 @@ class Studio:
             raise StudioError("Could not reset the MLA (needs passwordless sudo or DINO_RESET_COMMAND)")
 
     def close(self) -> None:
+        self.voice.close()
         with self.lock:
             if self.backend is not None:
                 self.backend.close()
@@ -751,8 +818,28 @@ def create_app(studio: Studio) -> Flask:
     def api_assist():
         d = studio.assist.describe()
         if not d["available"]:
-            return err("Prompt assist (LLiMa) is not enabled in this build", 503)
-        return jsonify({"text": studio.assist.rewrite((request.get_json(silent=True) or {}).get("text", ""))})
+            return err("Prompt assist needs Voice on (Settings → Voice): it uses the voice LLM", 503)
+        r = studio.voice.to_prompt((request.get_json(silent=True) or {}).get("text", ""))
+        return jsonify({"text": r["prompt"], "by": r["by"], "ms": r["ms"]})
+
+    @app.post("/api/voice/<action>")
+    def api_voice(action):
+        try:
+            if action == "start":
+                studio.voice_start((request.get_json(silent=True) or {}).get("llm") or None, who())
+            elif action == "stop":
+                studio.voice_stop(who())
+            elif action == "prompt":
+                f = request.files.get("audio")
+                if f is None:
+                    return err("Send the recording as 'audio'")
+                return jsonify(studio.voice_prompt(f.read(), f.filename or "speech.webm",
+                                                   f.mimetype or "audio/webm"))
+            else:
+                return err(f"unknown action {action}", 404)
+        except StudioError as e:
+            return err(e, 409)
+        return jsonify({"ok": True, "voice": studio.voice.status()})
 
     @app.post("/api/detect")
     def api_detect():
@@ -871,6 +958,11 @@ def main() -> int:
     ap.add_argument("--fake-load-seconds", type=float, default=0.0, help=argparse.SUPPRESS)
     ap.add_argument("--runtime", default=os.environ.get("DINO_RT") or str(ROOT / "runtime/build/dino_rt"))
     ap.add_argument("--hub-repo", default=HUB_REPO)
+    ap.add_argument("--llima-models", default=os.environ.get("DINO_LLIMA_MODELS", "/media/nvme/llima/models"),
+                    help="LLiMa model folders (Whisper and the LLM for voice prompts)")
+    ap.add_argument("--voice-port", type=int, default=9987, help="local port of the voice sidecar")
+    ap.add_argument("--voice", choices=["auto", "on", "off"], default="auto",
+                    help="start voice at launch: auto = as last time (Settings → Voice)")
     ap.add_argument("--list-hub", action="store_true")
     ap.add_argument("--fetch", nargs="+", metavar="NAME")
     ap.add_argument("--no-https", dest="https", action="store_false")
@@ -883,6 +975,11 @@ def main() -> int:
     studio = Studio(args)
     if args.model:
         studio.load(args.model, "startup")
+    if args.backend == "mla" and (args.voice == "on" or (args.voice == "auto" and studio.prefs().get("voice"))):
+        try:
+            studio.voice.start(llm=studio.prefs().get("voice_llm"))
+        except VoiceError as e:
+            log(f"voice not started: {e}")
     server = make_server(args.host, args.port, create_app(studio), threaded=True)
     args.tls = False
     if args.https and Path(args.cert).exists() and Path(args.key).exists():

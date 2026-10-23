@@ -24,6 +24,7 @@
   <symbol id="i-webcam" viewBox="0 0 24 24"><circle cx="12" cy="10" r="6.5"/><circle cx="12" cy="10" r="2.6"/><path d="M8 20h8M12 16.5V20"/></symbol>
   <symbol id="i-live" viewBox="0 0 24 24"><circle cx="12" cy="12" r="2.2"/><path d="M8.2 8.2a5.4 5.4 0 0 0 0 7.6M15.8 8.2a5.4 5.4 0 0 1 0 7.6M5.4 5.4a9.3 9.3 0 0 0 0 13.2M18.6 5.4a9.3 9.3 0 0 1 0 13.2"/></symbol>
   <symbol id="i-snap" viewBox="0 0 24 24"><path d="M4 8.5A1.5 1.5 0 0 1 5.5 7h2l1.4-2h6.2l1.4 2h2A1.5 1.5 0 0 1 20 8.5v9a1.5 1.5 0 0 1-1.5 1.5h-13A1.5 1.5 0 0 1 4 17.5z"/><circle cx="12" cy="12.8" r="3.4"/></symbol>
+  <symbol id="i-mic" viewBox="0 0 24 24"><rect x="9" y="3.5" width="6" height="11" rx="3"/><path d="M5.5 11.5a6.5 6.5 0 0 0 13 0M12 18v2.5"/></symbol>
   <symbol id="i-stop" viewBox="0 0 24 24"><rect x="6.5" y="6.5" width="11" height="11" rx="2"/></symbol>
   <symbol id="i-sun" viewBox="0 0 24 24"><circle cx="12" cy="12" r="4"/><path d="M12 2.5v2M12 19.5v2M4.6 4.6l1.4 1.4M18 18l1.4 1.4M2.5 12h2M19.5 12h2M4.6 19.4 6 18M18 6l1.4-1.4"/></symbol>
   <symbol id="i-moon" viewBox="0 0 24 24"><path d="M20 14.5A8 8 0 0 1 9.5 4a8 8 0 1 0 10.5 10.5z"/></symbol>
@@ -101,8 +102,12 @@
         <div class="card-head"><h2>Find</h2><span class="tokens" id="tokens" title="Text tokens used (Grounding DINO reads up to 64)"></span></div>
         <div class="prompt-box">
           <textarea id="prompt" rows="2" spellcheck="false" placeholder="person . red car . dog with a frisbee ."></textarea>
-          <button class="btn primary detect-btn" id="detect-btn" title="Detect (Ctrl+Enter)"><svg><use href="#i-search"/></svg>Detect</button>
+          <div class="prompt-actions">
+            <button class="btn primary detect-btn" id="detect-btn" title="Detect (Enter)"><svg><use href="#i-search"/></svg>Detect</button>
+            <button class="btn mic-btn" id="mic-btn" title="Speak what to find: hold to talk, or click to start and stop"><svg><use href="#i-mic"/></svg><span class="mic-t">Speak</span></button>
+          </div>
         </div>
+        <div class="voice-line" id="voice-line" hidden></div>
         <div class="assist-row" id="assist-row" hidden>
           <button class="btn subtle" id="assist-btn"><svg><use href="#i-sparkle"/></svg>Assist</button>
           <span class="muted small" id="assist-note"></span>
@@ -139,6 +144,7 @@
     <nav class="modal-nav">
       <div class="modal-title">Settings</div>
       <button class="nav-item active" data-pane="models"><svg><use href="#i-chip"/></svg>Models</button>
+      <button class="nav-item" data-pane="voice"><svg><use href="#i-mic"/></svg>Voice</button>
       <button class="nav-item" data-pane="display"><svg><use href="#i-image"/></svg>Display</button>
       <button class="nav-item" data-pane="about"><svg><use href="#i-shield"/></svg>About</button>
     </nav>
@@ -158,6 +164,17 @@
         </div>
       </section>
 
+      <section class="pane" data-pane="voice" hidden>
+        <h3>Voice</h3>
+        <p class="muted">Say what to find. Whisper turns your speech into text and a small LLM turns the request into
+          phrases for the detector: “can you find the red cars and any dogs” → <code>red car . dog .</code>
+          Both run on the MLA through LLiMa, next to the detector.</p>
+        <div class="model-list" id="voice-card"></div>
+        <label class="check"><input type="checkbox" id="voice-autorun" checked> <span>Detect Right After Speaking</span></label>
+        <p class="muted small">The microphone needs the page over HTTPS (this studio serves both on the same port).
+          Hold the Speak button (or the space bar outside the text box) while talking.</p>
+      </section>
+
       <section class="pane" data-pane="display" hidden>
         <h3>Display</h3>
         <label class="slider"><span>Box Line Width</span><input type="range" id="line-w" min="1" max="6" step="0.5" value="2.5"><output id="line-w-v">2.5</output></label>
@@ -169,8 +186,9 @@
       <section class="pane" data-pane="about" hidden>
         <h3>About</h3>
         <p><b>Neat DINO Studio</b> runs <a href="https://huggingface.co/IDEA-Research/grounding-dino-base" target="_blank" rel="noopener">Grounding DINO (base)</a>
-          on the SiMa.ai Modalix MLA. The network is compiled into 21 MLA programs; between them the board's CPU does the
-          deformable-attention sampling, the top-900 query selection and the box updates.</p>
+          on the SiMa.ai Modalix MLA. The network is compiled into 30 MLA programs; between them the board's CPU does the
+          deformable-attention sampling, the top-900 query selection and the box updates. In Live mode two frames are in
+          flight: one on the MLA while the CPU samples the other.</p>
         <p class="muted small" id="about-status"></p>
         <p class="muted small">Model: <a href="https://huggingface.co/IDEA-Research/grounding-dino-base" target="_blank" rel="noopener">IDEA-Research/grounding-dino-base</a>
           — Swin-B image backbone, BERT Base text encoder, 6-layer deformable encoder and decoder, 900 queries, 232 M parameters,

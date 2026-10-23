@@ -72,6 +72,16 @@ def finish(out: Path, manifest: dict):
     print(f"{out}: {len(manifest['files'])} files, {total / 2**20:.0f} MB")
 
 
+def stage_dir(prec: str, name: str, used: dict) -> Path:
+    """build/stages/<prec>/<name>; stages not built in <prec> come from bf16 (w8a16 bundles keep the
+    decoder in bf16: int8 weights don't make its small programs faster)."""
+    d = ROOT / "build" / "stages" / prec / name
+    if prec != "bf16" and not any(d.glob("*_mpk.tar.gz")):
+        d = ROOT / "build" / "stages" / "bf16" / name
+    used[name.split("_", 1)[1] if name[0] == "s" and name[1:4].isdigit() else name] = d.parent.name
+    return d
+
+
 def detector(S: int, prec: str, skip=(), fused=True):
     import dino_mla as M
     from transformers import AutoModelForZeroShotObjectDetection
@@ -88,6 +98,7 @@ def detector(S: int, prec: str, skip=(), fused=True):
         plan = BP.build(hf, S)
     (out / "tables").mkdir()
     program = []
+    used: dict[str, str] = {}
     for i, st in enumerate(plan):
         e = {"op": st.op, "name": st.name}
         if st.op == "patchify":
@@ -96,7 +107,7 @@ def detector(S: int, prec: str, skip=(), fused=True):
             e.update(src=st.src, dst=st.dst, dst_off=st.dst_off,
                      in_elems=int(np.prod(st.in_shape)), out_elems=int(np.prod(st.out_shape)))
             if "backbone" not in skip:
-                extract_elf(ROOT / "build" / "stages" / prec / f"s{S}_{st.name}", out / "elf" / f"{st.name}.elf")
+                extract_elf(stage_dir(prec, f"s{S}_{st.name}", used), out / "elf" / f"{st.name}.elf")
         if st.op == "gather":
             e.update(src=st.src, dst=st.dst, dst_off=st.dst_off, k=st.k, c=st.c)
         if st.table is not None:
@@ -107,7 +118,7 @@ def detector(S: int, prec: str, skip=(), fused=True):
     for st in STAGES:
         if st in skip:
             continue
-        extract_elf(ROOT / "build" / "stages" / prec / f"s{S}_{st}", out / "elf" / f"{st}.elf")
+        extract_elf(stage_dir(prec, f"s{S}_{st}", used), out / "elf" / f"{st}.elf")
     g = M.geometry(hf, S)
     bf16(M.tok_to_rows(g.pos).numpy()).tofile(out / "pos.bf16")
     g.ref.numpy().astype(np.float32).tofile(out / "ref.f32")
@@ -121,6 +132,7 @@ def detector(S: int, prec: str, skip=(), fused=True):
     finish(out, {"format": FORMAT, "model": "IDEA-Research/grounding-dino-base", "kind": "detector",
                  "name": f"dino-{S}-{prec}", "requires": "dino-text-t64-bf16", "size": S, "precision": prec, "tokens": g.N, "queries": M.NQ, "text_tokens": M.T_TXT,
                  "levels": [[h, w, int(s)] for (h, w), s in zip(g.shapes, starts)], "stages": STAGES,
+                 "stage_precision": used,
                  "backbone": program})
 
 

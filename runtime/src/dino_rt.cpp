@@ -9,7 +9,11 @@
 // a (1, 256, 1, W) tensor); stages are packed along W (see model/dino_mla.py).
 // Host code reads and writes those buffers in place.
 //
-// Protocol (stdin/stdout, little endian), one request at a time:
+// Protocol (stdin/stdout, little endian). Replies come back in request order, but a
+// client may send the next DETECT before the last reply arrived (Live mode): with two
+// "slots" (DINO_SLOTS=2, the default) two frames are in flight, one on the MLA while the
+// other's deformable sampling runs on the CPU. The slots share the loaded programs
+// (SimaLMM keys them by ELF path) and have their own device buffers.
 //   request : "DINO" u32 cmd u32 nbytes payload
 //   response: "DINO" u32 status(0 ok) u32 nbytes payload
 //   cmd 1 INFO     -> JSON
@@ -27,7 +31,14 @@
 #include <omp.h>
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
+#include <condition_variable>
+#include <deque>
+#include <functional>
+#include <mutex>
+#include <set>
+#include <thread>
 #include <cmath>
 #include <csignal>
 #include <cstdio>
@@ -110,11 +121,92 @@ struct BbStep {
   std::vector<int32_t> table;
 };
 
+// One MLA program runs at a time. When two slots want the MLA, the older request (lower
+// sequence number) goes first, so the frame that is further along finishes first.
+class MlaArbiter {
+ public:
+  void acquire(uint64_t prio) {
+    std::unique_lock<std::mutex> l(m_);
+    auto it = waiting_.insert(prio);
+    cv_.wait(l, [&] { return !busy_ && *waiting_.begin() == prio; });
+    waiting_.erase(it);
+    busy_ = true;
+  }
+  void release() {
+    {
+      std::lock_guard<std::mutex> l(m_);
+      busy_ = false;
+    }
+    cv_.notify_all();
+  }
+
+ private:
+  std::mutex m_;
+  std::condition_variable cv_;
+  std::multiset<uint64_t> waiting_;
+  bool busy_ = false;
+};
+
+static MlaArbiter g_mla;
+// Slots in a CPU phase right now share the cores; a slot waiting for or running an MLA
+// program leaves them to the other.
+static std::atomic<int> g_cpu{0};
+static int g_max_threads = 1;
+static bool g_multi_slot = false;   // queued back-to-back programs would hold the MLA too long
+
+// DINO_TRACE=<file>: every MLA turn (slot, wait start, start, end in us) for timeline plots.
+struct TraceEv {
+  int slot;
+  uint64_t seq;
+  double wait, start, end;
+  std::string what;
+};
+static std::mutex g_trace_m;
+static std::vector<TraceEv> g_trace;
+static const char* g_trace_path = std::getenv("DINO_TRACE");
+static const Clock::time_point g_t0 = Clock::now();
+static double now_us() { return std::chrono::duration<double, std::micro>(Clock::now() - g_t0).count(); }
+static thread_local int t_slot = 0;
+static thread_local bool t_in_cpu = false;
+static void cpu_phase() {
+  if (!t_in_cpu) {
+    ++g_cpu;
+    t_in_cpu = true;
+  }
+  omp_set_num_threads(std::max(1, g_max_threads / std::max(1, g_cpu.load())));
+}
+static void cpu_leave() {
+  if (t_in_cpu) {
+    --g_cpu;
+    t_in_cpu = false;
+  }
+}
+
+struct MlaTurn {
+  explicit MlaTurn(uint64_t prio, const char* what = "mla") : prio_(prio), what_(what) {
+    cpu_leave();
+    if (g_trace_path) wait_ = now_us();
+    g_mla.acquire(prio);
+    if (g_trace_path) start_ = now_us();
+  }
+  ~MlaTurn() {
+    g_mla.release();
+    if (g_trace_path) {
+      std::lock_guard<std::mutex> l(g_trace_m);
+      g_trace.push_back({t_slot, prio_, wait_, start_, now_us(), what_});
+    }
+  }
+  uint64_t prio_;
+  const char* what_;
+  double wait_ = 0, start_ = 0;
+};
+
 struct Stage {
   std::string name;
   std::unique_ptr<llima::MLAModelWithBuffer> model;
   double last_ms = 0;
-  void run() {
+  void run(uint64_t prio) {
+    MlaTurn turn(prio, name.c_str());
     auto t = Clock::now();
     model->run();
     last_ms = ms_since(t);
@@ -123,7 +215,9 @@ struct Stage {
 
 class Detector {
  public:
-  Detector(const fs::path& bundle, const fs::path& text_bundle) : dir_(bundle) {
+  // slot 0 reports load progress; further slots bind the same (already loaded) ELFs to
+  // their own buffers.
+  Detector(const fs::path& bundle, const fs::path& text_bundle, int slot = 0) : dir_(bundle), slot_(slot) {
     const json m = json::parse(read_file(bundle / "manifest.json"));
     S_ = m.at("size");
     N_ = m.at("tokens");
@@ -239,22 +333,29 @@ class Detector {
     // Progress lines for the app's loading bar: "DINOLOAD <done> <total> <stage>".
     size_t done = 0;
     for (auto& [n, s] : stages_) {
-      std::fprintf(stderr, "DINOLOAD %zu %zu %s\n", done, stages_.size(), n.c_str());
-      std::fflush(stderr);
+      if (slot_ == 0) {
+        std::fprintf(stderr, "DINOLOAD %zu %zu %s\n", done, stages_.size(), n.c_str());
+        std::fflush(stderr);
+      }
       s->model->load();
       ++done;
     }
-    std::fprintf(stderr, "DINOLOAD %zu %zu done\n", done, stages_.size());
-    std::fprintf(stderr, "dino_rt: S=%d N=%zu, %zu stages loaded in %.0f ms\n", S_, N_, stages_.size(), ms_since(t));
+    if (slot_ == 0) std::fprintf(stderr, "DINOLOAD %zu %zu done\n", done, stages_.size());
+    std::fprintf(stderr, "dino_rt: slot %d: S=%d N=%zu, %zu stages loaded in %.0f ms\n", slot_, S_, N_,
+                 stages_.size(), ms_since(t));
   }
 
+  // SimaLMM keys programs by path: load() of an already loaded ELF and a second free() do
+  // nothing, so whichever slot goes first frees the shared programs.
   ~Detector() {
     for (auto& [n, s] : stages_) s->model->free();
   }
 
+  uint64_t prio = 0;  // sequence number of the request being served (MLA priority)
+
   json info() const {
     return {{"size", S_}, {"tokens", N_}, {"queries", NQ}, {"text_tokens", T}, {"stages", stages_.size()},
-            {"threads", omp_get_max_threads()}};
+            {"threads", g_max_threads}};
   }
 
   // text_in [64][832] (embeddings | additive mask, key on C); tp [193][256] (T columns ignored)
@@ -262,11 +363,18 @@ class Detector {
     auto t0 = Clock::now();
     to_bf16_span(text_in, txt_in_->p(), (size_t)T * 832);
     txt_in_->b.flush_cache();
-    stages_["text"]->run();
+    stages_["text"]->run(prio);
     txt_out_->b.invalidate_cache();
+    put_text(txt_out_->p(), tp);
+    return ms_since(t0);
+  }
+  const uint16_t* text_features() { return txt_out_->p(); }
+
+  // text features (T x 256 bf16, the text stage's output) + text pack -> every stage input
+  void put_text(const uint16_t* feats, const float* tp) {
     std::vector<uint16_t> tpb((size_t)TPW * kD);
     to_bf16_span(tp, tpb.data(), tpb.size());
-    std::memcpy(tpb.data(), txt_out_->p(), (size_t)T * kD * 2);   // text features into cols 0..63
+    std::memcpy(tpb.data(), feats, (size_t)T * kD * 2);   // text features into cols 0..63
     const size_t N = N_;
     auto put = [&](Buffer& b, size_t at) {
       std::memcpy(b.tok(at), tpb.data(), tpb.size() * 2);
@@ -277,7 +385,6 @@ class Detector {
     for (auto& b : dpre_in_) put(*b, 3 * NQ);
     put(*dpost_in_, 2 * NQ);
     have_text_ = true;
-    return ms_since(t0);
   }
 
   // rgb: S x S x 3 uint8, image at the top-left, valid_w x valid_h; the rest is padding.
@@ -298,10 +405,11 @@ class Detector {
     double mla = 0, cpu = 0;
     for (int k = 0; k <= 6; ++k) {
       Stage& st = *stages_["enc" + std::to_string(k)];
-      st.run();
+      st.run(prio);
       mla += st.last_ms;
       if (k == 6) break;
       auto tc = Clock::now();
+      cpu_phase();
       Buffer& next = (k + 1 == 6) ? *ek_in_[0] : *ek_in_[(k + 1) % 2];
       e_out_->invalidate(0, 4 * N + T);
       // X1 -> next X; T -> next TP text columns; sampled -> next S
@@ -325,11 +433,12 @@ class Detector {
     timing[3] = cpu;
 
     // ---- decoder value maps (bound to the memory columns of enc6's output)
-    stages_["dec_values"]->run();
+    stages_["dec_values"]->run(prio);
     timing[4] = stages_["dec_values"]->last_ms;
 
     // ---- two-stage top-k on the host
     auto tk = Clock::now();
+    cpu_phase();
     e6_out_->invalidate(0, 2 * N + T);
     dv_out_->b.invalidate_cache();
     std::vector<float> t6((size_t)T * kD);
@@ -380,6 +489,7 @@ class Detector {
     std::vector<float> qs((size_t)NQ * 512);
     for (int k = 0; k < 6; ++k) {
       auto tc = Clock::now();
+      cpu_phase();
       Buffer& pin = *dpre_in_[k % 2];
       sine_box(ref4.data(), qs.data());
 #pragma omp parallel for schedule(static)
@@ -390,7 +500,7 @@ class Detector {
       pin.flush(0, 3 * NQ);
       dcpu += ms_since(tc);
       Stage& pre = *stages_["dec_pre" + std::to_string(k)];
-      pre.run();
+      pre.run(prio);
       dmla += pre.last_ms;
       tc = Clock::now();
       dpre_out_->b.invalidate_cache();
@@ -408,7 +518,7 @@ class Detector {
       dpost_in_->flush(0, 2 * NQ);
       dcpu += ms_since(tc);
       Stage& post = *stages_["dec_post" + std::to_string(k)];
-      post.run();
+      post.run(prio);
       dmla += post.last_ms;
       tc = Clock::now();
       dpost_out_->b.invalidate_cache();
@@ -494,22 +604,25 @@ class Detector {
     for (size_t si = 0; si < bb_.size(); ++si) {
       auto& st = bb_[si];
       auto t = Clock::now();
-      if (st.op == "run" && queue_ && si + 1 < bb_.size() && bb_[si + 1].op == "run") {
+      if (st.op == "run" && queue_ && !g_multi_slot && si + 1 < bb_.size() && bb_[si + 1].op == "run") {
         // Back-to-back MLA programs (no CPU step between): one queued submission.
         size_t sj = si;
+        MlaTurn turn(prio);
+        t = Clock::now();
         while (sj < bb_.size() && bb_[sj].op == "run") stages_[bb_[sj++].name]->model->add_to_queue();
         llima::MLAModelWithBuffer::run_queue();
         mla += ms_since(t);
         si = sj - 1;
         continue;
       }
+      cpu_phase();
       if (st.op == "patchify") {
         patchify(rgb, vw, vh, st.table, st.grid);
         cpu += ms_since(t);
         timing[0] = (float)ms_since(t);
       } else if (st.op == "run") {
         Stage& s = *stages_[st.name];
-        s.run();
+        s.run(prio);
         mla += s.last_ms;
       } else if (st.op == "gather") {
         Buffer& src = buf(st.src);
@@ -560,6 +673,7 @@ class Detector {
   }
 
   fs::path dir_;
+  int slot_ = 0;
   int S_ = 0;
   size_t N_ = 0;
   Level levels_[kLevels];
@@ -570,6 +684,8 @@ class Detector {
   bool have_text_ = false;
   bool has_image_ = false;
   std::vector<BbStep> bb_;
+  // Queued back-to-back programs hold the MLA longer; with two slots the other frame
+  // would wait, so the queue is only used with one slot.
   bool queue_ = std::getenv("DINO_NO_QUEUE") == nullptr;
   bool has_backbone_ = true;
   std::unique_ptr<Buffer> bb_a_, bb_b_, bb_p_, txt_in_, txt_out_, e0_in_, ek_in_[2], e_out_, e6_out_, dv_out_, dpre_in_[2],
@@ -600,78 +716,200 @@ static void write_all(int fd, const void* p, size_t n) {
   }
 }
 
-static void reply(int fd, uint32_t status, const void* data, size_t n) {
-  const char magic[4] = {'D', 'I', 'N', 'O'};
-  const uint32_t len = (uint32_t)n;
-  write_all(fd, magic, 4);
-  write_all(fd, &status, 4);
-  write_all(fd, &len, 4);
-  if (n) write_all(fd, data, n);
-}
-
 static volatile std::sig_atomic_t g_stop = 0;
 
-int serve(Detector& det, int out) {
-  const int in = 0;
-  std::vector<char> buf;
-  while (!g_stop) {
-    char magic[4];
-    uint32_t cmd = 0, n = 0;
-    if (!read_all(in, magic, 4) || !read_all(in, &cmd, 4) || !read_all(in, &n, 4)) break;
-    if (std::memcmp(magic, "DINO", 4) != 0) {
-      std::fprintf(stderr, "dino_rt: bad request header\n");
-      return 1;
+// Reads requests on the main thread; DETECT-type requests go to the slot with less work,
+// everything else waits until the slots are idle. Replies are written in request order.
+class Server {
+ public:
+  Server(std::vector<std::unique_ptr<Detector>>& det, int out) : det_(det), out_(out), slots_(det.size()) {
+    for (size_t i = 0; i < det_.size(); ++i) workers_.emplace_back([this, i] { work(i); });
+  }
+  ~Server() {
+    {
+      std::lock_guard<std::mutex> l(m_);
+      quit_ = true;
     }
-    buf.resize(n);
-    if (n && !read_all(in, buf.data(), n)) break;
-    try {
-      if (cmd == 1) {
-        const std::string s = det.info().dump();
-        reply(out, 0, s.data(), s.size());
-      } else if (cmd == 2) {
-        const size_t need = ((size_t)T * 832 + (size_t)TPW * kD) * 4;
-        if (n != need) throw std::runtime_error("TEXT payload size");
-        const float* f = reinterpret_cast<const float*>(buf.data());
-        det.set_token_mask(f + (size_t)T * 832);
-        const float ms = (float)det.set_text(f, f + (size_t)T * 832);
-        reply(out, 0, &ms, 4);
-      } else if (cmd == 3) {
-        const size_t S = det.size();
-        if (n != 8 + S * S * 3) throw std::runtime_error("DETECT payload size");
-        uint32_t vw, vh;
-        std::memcpy(&vw, buf.data(), 4);
-        std::memcpy(&vh, buf.data() + 4, 4);
-        std::vector<float> res((size_t)NQ * T + NQ * 4 + 32);
-        det.detect(reinterpret_cast<const uint8_t*>(buf.data() + 8), (int)vw, (int)vh, res.data(),
-                   res.data() + (size_t)NQ * T, res.data() + (size_t)NQ * T + NQ * 4);
-        reply(out, 0, res.data(), res.size() * 4);
-      } else if (cmd == 5) {
-        // DETECT_TOKENS (debug): f32 backbone tokens [N][256] -> same reply as DETECT
-        if (n != det.tokens() * kD * 4) throw std::runtime_error("DETECT_TOKENS payload size");
-        det.put_tokens(reinterpret_cast<const float*>(buf.data()));
-        std::vector<float> res((size_t)NQ * T + NQ * 4 + 32);
-        det.detect(nullptr, 0, 0, res.data(), res.data() + (size_t)NQ * T, res.data() + (size_t)NQ * T + NQ * 4);
-        reply(out, 0, res.data(), res.size() * 4);
-      } else if (cmd == 6) {
-        // DETECT_CACHED: the same image as last time (the backbone output is still in place),
-        // e.g. after a prompt change -> same reply as DETECT
-        if (!det.has_image()) throw std::runtime_error("no image yet");
-        std::vector<float> res((size_t)NQ * T + NQ * 4 + 32);
-        det.detect(nullptr, 0, 0, res.data(), res.data() + (size_t)NQ * T, res.data() + (size_t)NQ * T + NQ * 4);
-        reply(out, 0, res.data(), res.size() * 4);
-      } else if (cmd == 4) {
-        reply(out, 0, nullptr, 0);
-        break;
-      } else {
-        throw std::runtime_error("unknown command " + std::to_string(cmd));
+    cv_.notify_all();
+    for (auto& w : workers_) w.join();
+  }
+
+  int run() {
+    const int in = 0;
+    while (!g_stop) {
+      char magic[4];
+      uint32_t cmd = 0, n = 0;
+      if (!read_all(in, magic, 4) || !read_all(in, &cmd, 4) || !read_all(in, &n, 4)) break;
+      if (std::memcmp(magic, "DINO", 4) != 0) {
+        std::fprintf(stderr, "dino_rt: bad request header\n");
+        drain();
+        return 1;
       }
-    } catch (const std::exception& e) {
-      std::fprintf(stderr, "dino_rt: %s\n", e.what());
-      reply(out, 1, e.what(), std::strlen(e.what()));
+      Job job{next_seq_++, cmd, std::vector<char>(n)};
+      if (n && !read_all(in, job.payload.data(), n)) break;
+      if (cmd == 3 || cmd == 5 || cmd == 6) {
+        std::lock_guard<std::mutex> l(m_);
+        size_t k;
+        if (cmd == 6) {
+          k = last_image_slot_;
+        } else {
+          // the slot with less queued work; on a tie, not the one used last
+          k = (last_image_slot_ + 1) % slots_.size();
+          for (size_t i = 0; i < slots_.size(); ++i)
+            if (load(i) < load(k)) k = i;
+          last_image_slot_ = k;
+        }
+        slots_[k].q.push_back(std::move(job));
+        cv_.notify_all();
+        continue;
+      }
+      drain();
+      try {
+        if (cmd == 1) {
+          json j = det_[0]->info();
+          j["slots"] = det_.size();
+          const std::string s = j.dump();
+          reply(job.seq, 0, s.data(), s.size());
+        } else if (cmd == 2) {
+          const size_t need = ((size_t)T * 832 + (size_t)TPW * kD) * 4;
+          if (n != need) throw std::runtime_error("TEXT payload size");
+          const float* f = reinterpret_cast<const float*>(job.payload.data());
+          const float* tp = f + (size_t)T * 832;
+          for (auto& d : det_) d->set_token_mask(tp);
+          det_[0]->prio = job.seq;
+          const float ms = (float)det_[0]->set_text(f, tp);
+          for (size_t i = 1; i < det_.size(); ++i) det_[i]->put_text(det_[0]->text_features(), tp);
+          reply(job.seq, 0, &ms, 4);
+        } else if (cmd == 4) {
+          reply(job.seq, 0, nullptr, 0);
+          return 0;
+        } else {
+          throw std::runtime_error("unknown command " + std::to_string(cmd));
+        }
+      } catch (const std::exception& e) {
+        std::fprintf(stderr, "dino_rt: %s\n", e.what());
+        reply(job.seq, 1, e.what(), std::strlen(e.what()));
+      }
+    }
+    drain();
+    return 0;
+  }
+
+ private:
+  struct Job {
+    uint64_t seq;
+    uint32_t cmd;
+    std::vector<char> payload;
+  };
+  struct Slot {
+    std::deque<Job> q;
+    bool busy = false;
+  };
+
+  size_t load(size_t i) const { return slots_[i].q.size() + (slots_[i].busy ? 1 : 0); }
+
+  void drain() {
+    std::unique_lock<std::mutex> l(m_);
+    cv_.wait(l, [&] {
+      for (size_t i = 0; i < slots_.size(); ++i)
+        if (load(i)) return false;
+      return true;
+    });
+  }
+
+  void work(size_t k) {
+    Detector& det = *det_[k];
+    t_slot = (int)k;
+    for (;;) {
+      Job job;
+      {
+        std::unique_lock<std::mutex> l(m_);
+        cv_.wait(l, [&] { return quit_ || !slots_[k].q.empty(); });
+        if (slots_[k].q.empty()) return;
+        job = std::move(slots_[k].q.front());
+        slots_[k].q.pop_front();
+        slots_[k].busy = true;
+      }
+      det.prio = job.seq;
+      std::vector<float> res((size_t)NQ * T + NQ * 4 + 32);
+      std::string error;
+      try {
+        float* lg = res.data();
+        float* bx = res.data() + (size_t)NQ * T;
+        float* tm = res.data() + (size_t)NQ * T + NQ * 4;
+        const size_t n = job.payload.size();
+        if (job.cmd == 3) {
+          const size_t S = det.size();
+          if (n != 8 + S * S * 3) throw std::runtime_error("DETECT payload size");
+          uint32_t vw, vh;
+          std::memcpy(&vw, job.payload.data(), 4);
+          std::memcpy(&vh, job.payload.data() + 4, 4);
+          det.detect(reinterpret_cast<const uint8_t*>(job.payload.data() + 8), (int)vw, (int)vh, lg, bx, tm);
+        } else if (job.cmd == 5) {
+          // DETECT_TOKENS (debug): f32 backbone tokens [N][256] -> same reply as DETECT
+          if (n != det.tokens() * kD * 4) throw std::runtime_error("DETECT_TOKENS payload size");
+          det.put_tokens(reinterpret_cast<const float*>(job.payload.data()));
+          det.detect(nullptr, 0, 0, lg, bx, tm);
+        } else {
+          // DETECT_CACHED: the same image as last time (its backbone output is still in this
+          // slot's buffers), e.g. after a prompt change -> same reply as DETECT
+          if (!det.has_image()) throw std::runtime_error("no image yet");
+          det.detect(nullptr, 0, 0, lg, bx, tm);
+        }
+        tm[10] = (float)k;
+      } catch (const std::exception& e) {
+        error = e.what();
+        std::fprintf(stderr, "dino_rt: %s\n", e.what());
+      }
+      cpu_leave();
+      if (error.empty())
+        reply(job.seq, 0, res.data(), res.size() * 4);
+      else
+        reply(job.seq, 1, error.data(), error.size());
+      {
+        std::lock_guard<std::mutex> l(m_);
+        slots_[k].busy = false;
+      }
+      cv_.notify_all();
     }
   }
-  return 0;
-}
+
+  // Write a reply once every earlier request has been answered.
+  void reply(uint64_t seq, uint32_t status, const void* data, size_t n) {
+    std::unique_lock<std::mutex> l(reply_m_);
+    reply_cv_.wait(l, [&] { return next_reply_ == seq; });
+    const char magic[4] = {'D', 'I', 'N', 'O'};
+    const uint32_t len = (uint32_t)n;
+    if (!broken_) {
+      try {
+        write_all(out_, magic, 4);
+        write_all(out_, &status, 4);
+        write_all(out_, &len, 4);
+        if (n) write_all(out_, data, n);
+      } catch (const std::exception& e) {
+        std::fprintf(stderr, "dino_rt: %s\n", e.what());   // client gone: stop after this
+        broken_ = true;
+        g_stop = 1;
+      }
+    }
+    ++next_reply_;
+    reply_cv_.notify_all();
+  }
+
+  std::vector<std::unique_ptr<Detector>>& det_;
+  int out_;
+  std::vector<Slot> slots_;
+  std::vector<std::thread> workers_;
+  std::mutex m_;
+  std::condition_variable cv_;
+  bool quit_ = false;
+  size_t last_image_slot_ = 0;
+  uint64_t next_seq_ = 0;
+  std::mutex reply_m_;
+  std::condition_variable reply_cv_;
+  uint64_t next_reply_ = 0;
+  bool broken_ = false;
+};
 
 }  // namespace dino
 
@@ -688,14 +926,35 @@ int main(int argc, char** argv) {
   ::dup2(2, 1);
   int rc = 0;
   llima::connect_mla_rt({});
+  dino::g_max_threads = omp_get_max_threads();
   try {
-    dino::Detector det(argv[1], argv[2]);
+    std::vector<std::unique_ptr<dino::Detector>> det;
+    det.push_back(std::make_unique<dino::Detector>(argv[1], argv[2], 0));
+    const char* ns = std::getenv("DINO_SLOTS");
+    const int slots = std::max(1, std::min(2, ns ? std::atoi(ns) : 2));
+    for (int k = 1; k < slots; ++k) {
+      try {
+        det.push_back(std::make_unique<dino::Detector>(argv[1], argv[2], k));
+      } catch (const std::exception& e) {
+        std::fprintf(stderr, "dino_rt: slot %d not available (%s); one frame at a time\n", k, e.what());
+        break;
+      }
+    }
+    dino::g_multi_slot = det.size() > 1;
     const char ready[] = "DINOREADY\n";
     std::fwrite(ready, 1, sizeof(ready) - 1, stderr);
-    rc = dino::serve(det, proto);
+    {
+      dino::Server server(det, proto);
+      rc = server.run();
+    }
   } catch (const std::exception& e) {
     std::fprintf(stderr, "dino_rt: fatal: %s\n", e.what());
     rc = 1;
+  }
+  if (dino::g_trace_path) {
+    std::ofstream f(dino::g_trace_path);
+    for (auto& e : dino::g_trace)
+      f << e.slot << ' ' << e.seq << ' ' << e.wait << ' ' << e.start << ' ' << e.end << ' ' << e.what << '\n';
   }
   llima::disconnect_mla_rt();
   return rc;

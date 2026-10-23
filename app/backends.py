@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import threading
 import time
+from concurrent.futures import Future
 from pathlib import Path
 
 import numpy as np
@@ -26,10 +27,20 @@ ACCELERATOR_LOCK = threading.RLock()
 class Backend:
     name = "base"
     size = 576
+    slots = 1          # frames that can be in flight at once (Live mode keeps this many queued)
 
     def set_prompt(self, pr: P.Prompt) -> float: ...
     def detect(self, rgb: np.ndarray, vw: int, vh: int, same_image: bool = False) -> Detections: ...
     def close(self) -> None: ...
+
+    def detect_async(self, rgb, vw, vh, same_image=False) -> Future:
+        """Start a detection; the default runs it now and returns a finished future."""
+        f: Future = Future()
+        try:
+            f.set_result(self.detect(rgb, vw, vh, same_image))
+        except Exception as e:  # noqa: BLE001
+            f.set_exception(e)
+        return f
 
 
 class RuntimeBackend(Backend):
@@ -40,6 +51,7 @@ class RuntimeBackend(Backend):
         with ACCELERATOR_LOCK:
             self.rt = DinoRuntime(binary, bundle, text_bundle, log=log, progress=progress)
         self.size = self.rt.size
+        self.slots = self.rt.slots
         self.tokenizer = self.text.tok
         self._prompt_key = None
 
@@ -56,10 +68,18 @@ class RuntimeBackend(Backend):
         return ms
 
     def detect(self, rgb, vw, vh, same_image=False):
+        return self.detect_async(rgb, vw, vh, same_image).result()
+
+    def detect_async(self, rgb, vw, vh, same_image=False):
+        # Only sending is serialised; dino_rt answers in order and runs two frames at once.
         with ACCELERATOR_LOCK:
             if same_image:
-                return self.rt.detect_cached()
-            return self.rt.detect(rgb, vw, vh)
+                f: Future = Future()
+                raw = self.rt._send(6)
+                raw.add_done_callback(lambda r: f.set_exception(r.exception()) if r.exception()
+                                      else f.set_result(self.rt._detections(r.result())))
+                return f
+            return self.rt.detect_async(rgb, vw, vh)
 
     def close(self):
         with ACCELERATOR_LOCK:
