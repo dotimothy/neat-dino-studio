@@ -31,6 +31,7 @@
 #include <cmath>
 #include <csignal>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
@@ -490,8 +491,18 @@ class Detector {
   // The backbone program: patchify, Swin blocks (MLA), token gathers (CPU), level projections.
   void run_backbone(const uint8_t* rgb, int vw, int vh, float* timing) {
     double mla = 0, cpu = 0;
-    for (auto& st : bb_) {
+    for (size_t si = 0; si < bb_.size(); ++si) {
+      auto& st = bb_[si];
       auto t = Clock::now();
+      if (st.op == "run" && queue_ && si + 1 < bb_.size() && bb_[si + 1].op == "run") {
+        // Back-to-back MLA programs (no CPU step between): one queued submission.
+        size_t sj = si;
+        while (sj < bb_.size() && bb_[sj].op == "run") stages_[bb_[sj++].name]->model->add_to_queue();
+        llima::MLAModelWithBuffer::run_queue();
+        mla += ms_since(t);
+        si = sj - 1;
+        continue;
+      }
       if (st.op == "patchify") {
         patchify(rgb, vw, vh, st.table, st.grid);
         cpu += ms_since(t);
@@ -559,6 +570,7 @@ class Detector {
   bool have_text_ = false;
   bool has_image_ = false;
   std::vector<BbStep> bb_;
+  bool queue_ = std::getenv("DINO_NO_QUEUE") == nullptr;
   bool has_backbone_ = true;
   std::unique_ptr<Buffer> bb_a_, bb_b_, bb_p_, txt_in_, txt_out_, e0_in_, ek_in_[2], e_out_, e6_out_, dv_out_, dpre_in_[2],
       dpre_out_, dpost_in_, dpost_out_;

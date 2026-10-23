@@ -72,7 +72,7 @@ def finish(out: Path, manifest: dict):
     print(f"{out}: {len(manifest['files'])} files, {total / 2**20:.0f} MB")
 
 
-def detector(S: int, prec: str, skip=()):
+def detector(S: int, prec: str, skip=(), fused=True):
     import dino_mla as M
     from transformers import AutoModelForZeroShotObjectDetection
     hf = AutoModelForZeroShotObjectDetection.from_pretrained("IDEA-Research/grounding-dino-base").eval()
@@ -81,7 +81,11 @@ def detector(S: int, prec: str, skip=()):
         shutil.rmtree(out)
     (out / "elf").mkdir(parents=True)
     import backbone_plan as BP
-    plan = BP.build(hf, S)
+    if fused:
+        import backbone_fused as BF
+        plan = BF.build_cpu_merge(hf, S)
+    else:
+        plan = BP.build(hf, S)
     (out / "tables").mkdir()
     program = []
     for i, st in enumerate(plan):
@@ -147,11 +151,12 @@ def main():
     ap.add_argument("--prec", default="bf16")
     ap.add_argument("--text", action="store_true")
     ap.add_argument("--skip", nargs="*", default=[], help="stages to leave out (debug bundles)")
+    ap.add_argument("--unfused", action="store_true", help="27-program backbone with CPU gathers (old layout)")
     a = ap.parse_args()
     if a.text:
         text(a.prec)
     if a.size:
-        detector(a.size, a.prec, set(a.skip))
+        detector(a.size, a.prec, set(a.skip), fused=not a.unfused)
 
 
 if __name__ == "__main__":

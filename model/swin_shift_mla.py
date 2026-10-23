@@ -55,3 +55,51 @@ def shifted_to_plain(y, nh, nw):
     tl, tr, bl, br = _quad(y, 0, 0), _quad(y, 0, 1), _quad(y, 1, 0), _quad(y, 1, 1)
     return _assemble(_shift_windows(br, nh, nw, -1, -1), _shift_windows(bl, nh, nw, -1, 0),
                      _shift_windows(tr, nh, nw, 0, -1), tl)
+
+
+def _zeros_like_windows(q, n):
+    """n zero windows shaped like q's windows, made from q (a shared zero constant would be
+    deduplicated and break the compile with "Layer names are not unique")."""
+    w = q[:, :, :1]
+    z = w - w
+    return torch.cat([z] * n, 2) if n > 1 else z
+
+
+def merge_windows(x, nh, nw):
+    """Swin patch merging in window layout.
+
+    x: plain layout of stage s, (1, C, nh*nw, 144). Returns the plain layout of stage s+1,
+    (1, 4C, nh2*nw2, 144) with nh2 = ceil(nh/2), channels in HF order
+    [(0,0), (1,0), (0,1), (1,1)]. Odd window grids are padded with zero windows (the next
+    block masks padded tokens after its first LayerNorm)."""
+    parts = []
+    for dy, dx in ((0, 0), (1, 0), (0, 1), (1, 1)):
+        rows = [x[:, :, :, (2 * u + dy) * WS + dx:(2 * u + dy) * WS + WS:2] for u in range(H)]
+        parts.append(torch.cat(rows, 3))                         # (1, C, nW, 36)
+    m = torch.cat(parts, 1)                                      # (1, 4C, nW, 36): 6x6 quadrant per old window
+    nh2, nw2 = -(-nh // 2), -(-nw // 2)
+    if nh % 2 or nw % 2:                                         # pad the window grid to even
+        cols = []
+        for b in range(nw):
+            c = m[:, :, b * nh:(b + 1) * nh]
+            cols.append(torch.cat([c, _zeros_like_windows(m, 1)], 2) if nh % 2 else c)
+        if nw % 2:
+            cols.append(_zeros_like_windows(m, 2 * nh2))
+        m = torch.cat(cols, 2)
+    nhe = 2 * nh2
+    quads = []
+    for (ra, cb) in ((0, 0), (0, 1), (1, 0), (1, 1)):             # TL, TR, BL, BR
+        sel = [m[:, :, (2 * B + cb) * nhe + ra:(2 * B + cb + 1) * nhe:2] for B in range(nw2)]
+        quads.append(torch.cat(sel, 2) if len(sel) > 1 else sel[0])
+    return _assemble(*quads)
+
+
+def unpartition(x, nh, nw, Hc=None, Wc=None):
+    """Plain window layout (1, C, nh*nw, 144) -> spatial (1, C, nh*12, nw*12), cropped to Hc x Wc.
+    The reshape only regroups the window and token axes (never channels)."""
+    C = x.shape[1]
+    cols = [x[:, :, b * nh:(b + 1) * nh, :].reshape(1, C, nh * WS, WS) for b in range(nw)]
+    s = torch.cat(cols, 3)
+    if Hc is not None and (Hc, Wc) != (nh * WS, nw * WS):
+        s = s[:, :, :Hc, :Wc]
+    return s

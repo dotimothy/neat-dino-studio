@@ -92,11 +92,16 @@ def export(name, module, x, ref_out, simplify=True):
           + (f"  UNEXPECTED OPS {bad}" if bad else ""))
 
 
-def export_backbone(hf, S, image, only=None):
-    """Export every MLA program of the window-layout backbone (model/backbone_plan.py)."""
+def export_backbone(hf, S, image, only=None, fused=False, skip_existing=False):
+    """Export every MLA program of the window-layout backbone (model/backbone_plan.py,
+    or the fused 9-program version in model/backbone_fused.py)."""
     import backbone_plan as BP
     from PIL import Image
-    steps = BP.build(hf, S)
+    if fused:
+        import backbone_fused as BF
+        steps = BF.build_cpu_merge(hf, S)
+    else:
+        steps = BP.build(hf, S)
     px, _ = letterbox(Image.open(image), S)
     rec = {}
     orig = BP.Step
@@ -116,7 +121,8 @@ def export_backbone(hf, S, image, only=None):
     BP.run_torch(steps, M.space_to_depth4(px), M.geometry(hf, S).N)
     for st, m in bufs_steps:
         st.module = m
-        if only and st.name not in only:
+        if (only and st.name not in only) or (skip_existing and (OUT / f"s{S}_{st.name}.onnx").exists()
+                                               and st.name in ("bb_stage1", "bb_stage3b", "bb_stage3c")):
             continue
         x, y = rec[st.name]
         export(f"s{S}_{st.name}", m, x, y)
@@ -129,6 +135,7 @@ def main():
     ap.add_argument("--stages", nargs="*", default=[])
     ap.add_argument("--all", action="store_true")
     ap.add_argument("--backbone-plan", action="store_true", help="export the window-layout backbone programs")
+    ap.add_argument("--backbone-fused", action="store_true", help="export the fused 9-program backbone")
     ap.add_argument("--image", default=str(ROOT / "data/images/cats.jpg"))
     ap.add_argument("--prompt", default="a cat. a remote control. a couch. a blanket.")
     a = ap.parse_args()
@@ -136,6 +143,10 @@ def main():
     from PIL import Image
     from transformers import AutoModelForZeroShotObjectDetection
     hf = AutoModelForZeroShotObjectDetection.from_pretrained("IDEA-Research/grounding-dino-base").eval()
+    if a.backbone_fused:
+        export_backbone(hf, a.size, a.image, fused=True)
+        if not stages:
+            return
     if a.backbone_plan or a.all:
         export_backbone(hf, a.size, a.image)
         if not stages:
