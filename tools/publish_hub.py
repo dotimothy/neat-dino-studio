@@ -9,6 +9,7 @@ encoder); webapp/server.py's Hub reads it. The repository also gets a model card
     python3 tools/publish_hub.py --dry-run                 # pack + write build/hub/ only
     python3 tools/publish_hub.py                           # pack, upload, list, card
     python3 tools/publish_hub.py --only dino-768-bf16      # one bundle (the list keeps the others)
+    python3 tools/publish_hub.py --card-only               # just the model card
 
 Needs huggingface_hub and a login with write access (`hf auth login`).
 """
@@ -67,15 +68,17 @@ tags: [sima-ai, modalix, mla, grounding-dino, open-vocabulary-detection, edge]
 [Neat DINO Studio](https://github.com/dotimothy/neat-dino-studio): type what to find
 ("person . red car . dog ."), get boxes, from a photo or a live webcam.
 
+**Weights:** [{UPSTREAM}](https://huggingface.co/{UPSTREAM}), the **Base** size of Grounding DINO: **232.3 M parameters** in total (Swin-B image backbone 86.9 M, BERT-base text encoder 108.9 M, feature enhancer, deformable decoder and heads 36.5 M), unchanged from the original and run in bf16. Apache-2.0.
+
 | Bundle | What | Size | Per image (board) | About |
 |---|---|---|---|---|
 {rows}
 
 ## How it runs
 
-The network is cut into 30 MLA programs, all bf16, one MLA ELF each: the text encoder (BERT +
-projection); the Swin-B backbone as 9 programs (whole stages, with the window shifts inside);
-7 encoder programs; decoder value maps and 12 decoder programs. Between them the board's Arm
+The network is cut into 30 MLA ELFs, all bf16: the text encoder (BERT +
+projection); the Swin-B backbone as 9 ELFs (whole stages, with the window shifts inside);
+7 encoder ELFs; decoder value maps and 12 decoder ELFs. Between them the board's Arm
 cores do what the MLA cannot: multi-scale deformable-attention sampling (NEON), the top-900
 query selection, the reference-box updates, and Swin patch merging. The runtime (`dino_rt`)
 runs the ELFs with SimaLMM's `MLAModelWithBuffer`, reads and writes their bf16 buffers in
@@ -103,7 +106,17 @@ def main():
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--no-collection", action="store_true")
     ap.add_argument("--latency", nargs="*", default=[], help="name=ms pairs measured on the board")
+    ap.add_argument("--card-only", action="store_true", help="only rewrite the model card from the published models.json")
     a = ap.parse_args()
+    if a.card_only:
+        import urllib.request
+        from huggingface_hub import HfApi
+        with urllib.request.urlopen(f"https://huggingface.co/{a.repo}/resolve/main/models.json", timeout=20) as r:
+            published = json.loads(r.read())["models"]
+        HfApi().upload_file(path_or_fileobj=card(a.repo, published).encode(), path_in_repo="README.md",
+                            repo_id=a.repo, commit_message="Update model card")
+        print(f"https://huggingface.co/{a.repo}")
+        return
     lat = dict(x.split("=") for x in a.latency)
     out = ROOT / "build" / "hub"
     bundles = sorted(p for p in (ROOT / "build" / "bundles").iterdir() if (p / "manifest.json").is_file())

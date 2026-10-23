@@ -1,6 +1,7 @@
 # Grounding DINO on the Modalix MLA — report
 
-IDEA-Research/grounding-dino-base (232 M parameters, Apache-2.0), compiled for the SiMa.ai
+IDEA-Research/grounding-dino-base — Grounding DINO **Base**, 232.3 M parameters (Swin-B 86.9 M, BERT-base
+108.9 M, encoder/decoder and heads 36.5 M), Apache-2.0 — compiled for the SiMa.ai
 Modalix MLA and served by Neat DINO Studio. Measured on a Modalix DevKit (eLxr, SimaLMM 0.5.0,
 sima-frontend 2.1.3), 2026-10-22/23.
 
@@ -8,7 +9,7 @@ sima-frontend 2.1.3), 2026-10-22/23.
 
 | | Fast · 576 px | Accurate · 768 px |
 |---|---|---|
-| MLA programs (bf16, 1 ELF each) | 29 + shared text encoder | 29 + shared text encoder |
+| MLA ELFs (bf16) | 29 + shared text encoder | 29 + shared text encoder |
 | Per new image, board | **~0.33 s** | **~0.54 s** |
 | COCO AP50 / APsmall, board | 65.5 / 18.4 | 69.8 / 26.3 |
 | Prompt change on the same image | ~0.25 s | ~0.41 s |
@@ -27,7 +28,7 @@ decoder values 2; top-k 4; decoder 19 MLA + 28 CPU; patchify 2. At 768: backbone
 encoder 145 + 202, decoder 18 + 30. (Before the Swin stages were fused: backbone 90 + 25 and
 140 + 45, 0.36 / 0.60 s per image.)
 
-## Why it is cut into 48 programs
+## Why it is cut into 30 ELFs
 
 1. **Deformable attention can't run on the MLA.** The MLA's GridSample compiles only for value
    maps up to 32 px wide and 16 channels, and costs ~0.3 µs per sample (≈1 s per encoder layer).
@@ -41,7 +42,7 @@ encoder 145 + 202, decoder 18 + 30. (Before the Swin stages were fused: backbone
 4. **Swin-B windows.** Window partitioning needs a 6-D reshape the MLA can't place; a 4-D
    reshape chain is placed but sends the compiler into "large tensor" mode that never finishes.
    So the tokens stay in window layout: each Swin stage (stage 3 in three groups of six blocks)
-   is one program, and the move between plain and shifted windows is Slice+Concat inside it
+   is one ELF, and the move between plain and shifted windows is Slice+Concat inside it
    (free on the MLA). Patch merging and the return to image order are 6 CPU gathers (7 ms at
    576): done on the MLA with step-2 slices and a spatial reshape they compile and pass the
    compiler's check, but compute wrong values on the board.
@@ -65,8 +66,8 @@ the same hops would cost seconds (EV74 tessellation of 1×N token tensors: 5 s p
 
 ## Int8 weights (w8a16): tried, not shipped
 
-The backbone and encoder programs were compiled with int8 weights and bf16 activations (the
-decoder's small programs got no faster, so they stay bf16). At 576 on the board:
+The backbone and encoder ELFs were compiled with int8 weights and bf16 activations (the
+decoder's small ELFs got no faster, so they stay bf16). At 576 on the board:
 
 | | bf16 | w8a16 |
 |---|---|---|
@@ -75,7 +76,7 @@ decoder's small programs got no faster, so they stay bf16). At 576 on the board:
 | COCO AP (500-image subset) | **42.0** | 41.5 |
 | Bundle / load time | 1.8 GB / 3 s | 2.1 GB / 6 s |
 
-The MLA programs are compute- rather than weight-bound here (a Swin stage: 14.7 → 12.4 ms,
+The ELFs are compute- rather than weight-bound here (a Swin stage: 14.7 → 12.4 ms,
 an encoder layer 11.7 → 10.3 ms, a decoder layer 1.25 → 1.36 ms), and the ELFs get larger,
 not smaller. 5 % speed for −0.5 AP and a bigger download is not a good trade, so the hub keeps
 bf16 only. `PREC=w8a16 compile/build_stages.sh` and `make_bundle.py --prec w8a16` still build it.
@@ -84,7 +85,7 @@ bf16 only. `PREC=w8a16 compile/build_stages.sh` and `make_bundle.py --prec w8a16
 
 One frame at a time leaves the MLA idle while the CPU samples (112 ms of the 330 ms at 576) and
 the CPU idle while the MLA runs. `dino_rt` now has two slots: each has its own device buffers,
-bound to the same loaded programs (SimaLMM keys programs by ELF path, so loading one twice costs
+bound to the same loaded ELFs (SimaLMM keys them by ELF path, so loading one twice costs
 nothing). The client sends the next frame before the last reply; replies come back in order.
 An arbiter gives the MLA to the older frame first, and the CPU threads are split between the
 slots that are sampling at that moment.
@@ -97,10 +98,10 @@ slots that are sampling at that moment.
 
 Results are bit-identical to one at a time (checked with two alternating images). The gain is
 capped by contention, not by idle hardware: a timeline (`DINO_TRACE=file`) shows the MLA busy
-71 % of the time. MLA programs run ~10 % slower while the other slot's NEON sampling runs (both
+71 % of the time. ELFs run ~10 % slower while the other slot's NEON sampling runs (both
 share DRAM bandwidth), sampling with 8 threads takes 24 ms vs 17 ms with 16 (the A65 has 8
-cores × 2 threads), and the older frame waits ~12 ms behind long backbone programs. Back-to-back
-programs are not queued in this mode, so the older frame can take the MLA between them.
+cores × 2 threads), and the older frame waits ~12 ms behind long backbone ELFs. Back-to-back
+ELFs are not queued in this mode, so the older frame can take the MLA between them.
 
 ## Voice prompts
 
@@ -114,7 +115,7 @@ On eight test requests Gemma 4 E2B gave the right phrases for all, including ind
 Two things matter when several MLA apps share the board:
 
 - **One process loads at a time.** A process that connects to the MLA dispatcher while another
-  is loading programs fails ("Unable to connect to the server from dispatcher", or
+  is loading ELFs fails ("Unable to connect to the server from dispatcher", or
   `MLA_LOAD_FAILED`). The studio serialises its own loads (detector and voice); other apps can
   still collide with it.
 - **Page cache sits in CMA.** After copying large model files, CmaFree dropped to ~400 MB and

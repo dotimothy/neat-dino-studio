@@ -10,3 +10,13 @@ modeling_swin.py (Copyright The HuggingFace Team, Apache License 2.0).
 
 Fonts: Inter and JetBrains Mono, SIL Open Font License 1.1
 (webapp/web/assets/fonts/OFL-*.txt).
+
+Sample photos (webapp/web/samples/): COCO val2017 images from Flickr, each under the
+Creative Commons Attribution 2.0 license (https://creativecommons.org/licenses/by/2.0/),
+resized and cropped for thumbnails. Sources:
+  road-dog.jpg  COCO 000000078823  http://farm1.staticflickr.com/9/13918737_12ed28cb16_z.jpg
+  boat-dog.jpg  COCO 000000190140  http://farm7.staticflickr.com/6118/6216901971_786976ff66_z.jpg
+  pizza.jpg  COCO 000000194724  http://farm7.staticflickr.com/6155/6165978029_81ac06fbe3_z.jpg
+  cows.jpg  COCO 000000402992  http://farm7.staticflickr.com/6135/5922506927_b60c053513_z.jpg
+  bird.jpg  COCO 000000309452  http://farm6.staticflickr.com/5523/9556185989_32d49ca90f_z.jpg
+  beach-horses.jpg  COCO 000000007281  http://farm5.staticflickr.com/4112/5022207571_74aab92fd5_z.jpg

@@ -7,6 +7,8 @@ Type or say what to find — <code>person . red car . dog with a frisbee .</code
 
 ![Neat DINO Studio](docs/screenshot.png)
 
+**Weights:** [IDEA-Research/grounding-dino-base](https://huggingface.co/IDEA-Research/grounding-dino-base), the **Base** size of Grounding DINO: **232.3 M parameters** in total (Swin-B image backbone 86.9 M, BERT-base text encoder 108.9 M, feature enhancer, deformable decoder and heads 36.5 M), unchanged from the original and run in bf16. Apache-2.0.
+
 ## What it does
 
 - **Any phrase, not a fixed class list.** Grounding DINO matches boxes to the words you type; each phrase gets its own color.
@@ -39,23 +41,23 @@ stop other MLA apps first.
 
 ## How it runs on the MLA
 
-Grounding DINO base is 232 M parameters: a Swin-B backbone, a BERT-base text encoder and a
+Grounding DINO Base is 232.3 M parameters: a Swin-B backbone, a BERT-base text encoder and a
 6+6-layer deformable transformer. Two parts of it do not map onto the MLA: multi-scale
 deformable attention samples at data-dependent points (the MLA's GridSample handles maps up to
 32 px wide, at ~0.3 µs a sample), and the two-stage query selection needs a top-900 over all
-image tokens. So the network is cut into MLA programs, and the board's Arm cores do the rest:
+image tokens. So the network is cut into MLA ELFs, and the board's Arm cores do the rest:
 
-| On the MLA (bf16, one ELF each) | On the A65 cores |
+| On the MLA (bf16 ELFs) | On the A65 cores |
 |---|---|
 | Text encoder (BERT + projection), once per prompt | Tokenizing, phrase masks, text position embedding |
-| Swin-B as 9 programs (fused stages, window shifts inside) | Swin patch merging and the return to image order (6 gathers) |
-| 7 encoder programs (fusion, text enhancer, deformable projections) | Deformable-attention sampling (NEON, 16 threads) |
-| Decoder value maps + 12 decoder programs | Top-900 selection, reference-box updates, sine embeddings |
+| Swin-B as 9 ELFs (fused stages, window shifts inside) | Swin patch merging and the return to image order (6 gathers) |
+| 7 encoder ELFs (fusion, text enhancer, deformable projections) | Deformable-attention sampling (NEON, 16 threads) |
+| Decoder value maps + 12 decoder ELFs | Top-900 selection, reference-box updates, sine embeddings |
 
 `runtime/` (`dino_rt`) runs the ELFs with SimaLMM's `MLAModelWithBuffer` and reads and writes
 their bf16 buffers in place, so there are no copies through the EV74 between stages. The web
 app (`webapp/server.py`) talks to it as a child process; unloading a model stops it cleanly.
-`dino_rt` has two *slots*, each with its own device buffers bound to the same loaded programs
+`dino_rt` has two *slots*, each with its own device buffers bound to the same loaded ELFs
 (SimaLMM shares an ELF loaded twice), so a second frame can start while the first is still
 running; the MLA goes to the older frame first, and the CPU threads are split between the slots
 that are sampling. Replies come back in request order.
@@ -76,7 +78,7 @@ Everything that produces the models is here:
 
 ```
 model/dino_mla.py        Grounding DINO rebuilt in MLA-friendly ops, stage by stage (checked against HF)
-model/backbone_plan.py   the window-layout Swin-B program
+model/backbone_plan.py   the window-layout Swin-B ELFs
 model/export_onnx.py     ONNX per stage, with real inputs/outputs for board checks
 compile/                 SiMa Model Compiler driver (bf16, MLA tessellation), probes, board checks
 tools/make_bundle.py     ELFs + tables + constants -> a runtime bundle

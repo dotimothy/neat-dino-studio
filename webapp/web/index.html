@@ -42,6 +42,7 @@
   <symbol id="i-flip" viewBox="0 0 24 24"><path d="M4 9a8 8 0 0 1 14.5-3M20 4v4h-4M20 15a8 8 0 0 1-14.5 3M4 20v-4h4"/></symbol>
   <symbol id="i-sparkle" viewBox="0 0 24 24"><path d="M12 3v4M12 17v4M3 12h4M17 12h4M6 6l2.5 2.5M15.5 15.5 18 18M6 18l2.5-2.5M15.5 8.5 18 6"/></symbol>
   <symbol id="i-alert" viewBox="0 0 24 24"><path d="M12 4 2.8 19.5h18.4z"/><path d="M12 10v4.5M12 17h.01"/></symbol>
+  <symbol id="i-chev" viewBox="0 0 24 24"><path d="m6.5 9.5 5.5 5.5 5.5-5.5"/></symbol>
   <symbol id="i-image" viewBox="0 0 24 24"><rect x="3.5" y="4.5" width="17" height="15" rx="2.5"/><circle cx="9" cy="10" r="1.6"/><path d="m4 17 4.5-4.5 3.5 3.5 2.5-2.5L20 19"/></symbol>
 </svg>
 
@@ -65,17 +66,49 @@
   </header>
 
   <div class="workspace">
-    <main class="stage-col">
+    <div class="topbar">
+      <div class="chipbar" id="chipbar" aria-label="Latest detection" hidden>
+        <div class="metric-group">
+          <div class="metric-group-head"><svg class="mg-ic"><use href="#i-chip"/></svg>On the MLA<span class="metric-group-model" id="chip-model"></span></div>
+          <div class="metric-group-items">
+            <div class="metric-item" title="Board time for the last detection"><span class="metric-value" id="m-total">—</span><span class="metric-label">Per Image</span></div>
+            <div class="metric-item" id="mi-fps" hidden><span class="metric-value" id="fps">—</span><span class="metric-label">Live</span></div>
+          </div>
+        </div>
+        <div class="metric-group">
+          <div class="metric-group-head">Where The Time Goes</div>
+          <div class="metric-group-items">
+            <div class="metric-item part" id="mp-text" title="Text encoder (BERT on the MLA; skipped when the prompt is unchanged)"><i class="part-dot pd-text"></i><span class="metric-value">—</span><span class="metric-label">Text</span></div>
+            <div class="metric-item part" id="mp-backbone" title="Swin-B image backbone"><i class="part-dot pd-backbone"></i><span class="metric-value">—</span><span class="metric-label">Backbone</span></div>
+            <div class="metric-item part" id="mp-encoder" title="Six encoder layers: MLA plus deformable sampling on the CPU"><i class="part-dot pd-encoder"></i><span class="metric-value">—</span><span class="metric-label">Encoder</span></div>
+            <div class="metric-item part" id="mp-decoder" title="Top-900 selection and six decoder layers"><i class="part-dot pd-decoder"></i><span class="metric-value">—</span><span class="metric-label">Decoder</span></div>
+            <div class="metric-item part" id="mp-other" title="Image decode, transfers and post-processing"><i class="part-dot pd-other"></i><span class="metric-value">—</span><span class="metric-label">Other</span></div>
+          </div>
+        </div>
+      </div>
       <div class="banner" id="banner" hidden></div>
+    </div>
+    <main class="stage-col">
       <div class="stage" id="stage">
         <div class="drop" id="drop">
-          <svg class="drop-ic"><use href="#i-image"/></svg>
-          <div class="drop-title">Drop A Photo, Paste One, Or Use The Webcam</div>
-          <div class="drop-sub">Then type what to find. Grounding DINO boxes any phrase, not a fixed list of classes.</div>
-          <div class="drop-actions">
-            <button class="btn primary" id="pick-btn"><svg><use href="#i-upload"/></svg>Upload Photo</button>
-            <button class="btn" id="cam-btn-2"><svg><use href="#i-webcam"/></svg>Open Webcam</button>
-          </div>
+          <section class="hero" aria-labelledby="hero-title">
+            <div class="hero-lockup">
+              <img class="hero-logo logo-for-dark" src="/static/assets/logo_bright.png" alt="SiMa.ai" width="196" height="46">
+              <img class="hero-logo logo-for-light" src="/static/assets/logo_dark.png" alt="SiMa.ai" width="196" height="46">
+              <h1 class="hero-title" id="hero-title">Find Anything You Can Name</h1>
+            </div>
+            <p class="hero-powered">Powered by <strong>Neat</strong> · <strong>Modalix MLA</strong></p>
+            <p class="hero-sub">Type or say what to look for, like <code>red car</code> or <code>dog with a frisbee</code>, and Grounding DINO
+              boxes every match. There is no fixed list of classes, and it all runs on the SiMa Modalix MLA.</p>
+            <button type="button" class="hero-model" id="hero-model" title="Models"><span class="hm-dot"></span><span id="hero-model-text">Connecting…</span></button>
+            <div class="drop-actions">
+              <button class="btn primary" id="pick-btn"><svg><use href="#i-upload"/></svg>Upload Photo</button>
+              <button class="btn" id="cam-btn-2"><svg><use href="#i-webcam"/></svg>Open Webcam</button>
+            </div>
+            <div class="samples-head"><span>Or Try A Sample</span></div>
+            <div class="samples" id="samples" aria-label="Sample photos"></div>
+            <p class="hero-hint">Drop or paste a photo anywhere · <kbd>Enter</kbd> Detect · Hold <kbd>Space</kbd> To Speak</p>
+          </section>
         </div>
         <div class="viewer" id="viewer" hidden>
           <img id="photo" alt="">
@@ -90,21 +123,19 @@
         <button class="btn" id="flip-btn" hidden title="Switch Camera"><svg><use href="#i-flip"/></svg></button>
         <button class="btn" id="snap-btn" hidden><svg><use href="#i-snap"/></svg>Snapshot</button>
         <button class="btn live" id="live-btn" hidden><svg><use href="#i-live"/></svg><span>Go Live</span></button>
+        <button class="btn mic-btn" id="mic-btn" title="Speak what to find: hold to talk, or click to start and stop"><svg><use href="#i-mic"/></svg><span class="mic-t">Speak</span></button>
         <span class="spacer"></span>
-        <span class="fps" id="fps" hidden></span>
         <input type="file" id="file" accept="image/*" hidden>
       </div>
-      <div class="timing" id="timing" hidden></div>
     </main>
 
     <aside class="rail">
-      <section class="card prompt-card">
-        <div class="card-head"><h2>Find</h2><span class="tokens" id="tokens" title="Text tokens used (Grounding DINO reads up to 64)"></span></div>
+      <section class="card prompt-card" data-card="find">
+        <div class="card-head"><button class="card-toggle" aria-expanded="true" title="Show or hide Find"><svg><use href="#i-chev"/></svg><h2>Find</h2></button><span class="tokens" id="tokens" title="Text tokens used (Grounding DINO reads up to 64)"></span></div>
         <div class="prompt-box">
           <textarea id="prompt" rows="2" spellcheck="false" placeholder="person . red car . dog with a frisbee ."></textarea>
           <div class="prompt-actions">
             <button class="btn primary detect-btn" id="detect-btn" title="Detect (Enter)"><svg><use href="#i-search"/></svg>Detect</button>
-            <button class="btn mic-btn" id="mic-btn" title="Speak what to find: hold to talk, or click to start and stop"><svg><use href="#i-mic"/></svg><span class="mic-t">Speak</span></button>
           </div>
         </div>
         <div class="voice-line" id="voice-line" hidden></div>
@@ -120,16 +151,16 @@
         </div>
       </section>
 
-      <section class="card">
-        <div class="card-head"><h2>Thresholds</h2><button class="link" id="reset-thr">Reset</button></div>
+      <section class="card" data-card="thresholds">
+        <div class="card-head"><button class="card-toggle" aria-expanded="true" title="Show or hide Thresholds"><svg><use href="#i-chev"/></svg><h2>Thresholds</h2></button><button class="link" id="reset-thr">Reset</button></div>
         <label class="slider"><span>Box Score</span><input type="range" id="box-thr" min="0.05" max="0.95" step="0.01" value="0.35"><output id="box-thr-v">0.35</output></label>
         <label class="slider"><span>Phrase Score</span><input type="range" id="text-thr" min="0.05" max="0.95" step="0.01" value="0.25"><output id="text-thr-v">0.25</output></label>
         <label class="check"><input type="checkbox" id="nms"> <span>Merge Overlapping Boxes (NMS)</span></label>
         <label class="check"><input type="checkbox" id="show-scores" checked> <span>Show Scores On Boxes</span></label>
       </section>
 
-      <section class="card results-card">
-        <div class="card-head"><h2>Detections</h2><span class="muted small" id="det-count"></span></div>
+      <section class="card results-card" data-card="detections">
+        <div class="card-head"><button class="card-toggle" aria-expanded="true" title="Show or hide Detections"><svg><use href="#i-chev"/></svg><h2>Detections</h2></button><span class="muted small" id="det-count"></span></div>
         <div class="det-model" id="det-model"></div>
         <div class="legend" id="legend"></div>
         <ol class="det-list" id="det-list"><li class="empty">Nothing yet.</li></ol>
@@ -145,6 +176,7 @@
       <div class="modal-title">Settings</div>
       <button class="nav-item active" data-pane="models"><svg><use href="#i-chip"/></svg>Models</button>
       <button class="nav-item" data-pane="voice"><svg><use href="#i-mic"/></svg>Voice</button>
+      <button class="nav-item" data-pane="devices"><svg><use href="#i-webcam"/></svg>Devices</button>
       <button class="nav-item" data-pane="display"><svg><use href="#i-image"/></svg>Display</button>
       <button class="nav-item" data-pane="about"><svg><use href="#i-shield"/></svg>About</button>
     </nav>
@@ -170,7 +202,12 @@
           phrases for the detector: “can you find the red cars and any dogs” → <code>red car . dog .</code>
           Both run on the MLA through LLiMa, next to the detector.</p>
         <div class="model-list" id="voice-card"></div>
+        <h4 class="pane-sub">Voice Models</h4>
+        <p class="muted small" id="voice-models-line"></p>
+        <div class="model-list" id="voice-models"></div>
         <label class="check"><input type="checkbox" id="voice-autorun" checked> <span>Detect Right After Speaking</span></label>
+        <label class="check"><input type="checkbox" id="voice-autostop" checked> <span>Stop Listening When I Stop Talking</span></label>
+        <label class="slider"><span>Pause Before Stopping</span><input type="range" id="voice-pause" min="0.4" max="2" step="0.1" value="0.8"><output id="voice-pause-v">0.8 s</output></label>
         <p class="muted small">The microphone needs the page over HTTPS (this studio serves both on the same port).
           Hold the Speak button (or the space bar outside the text box) while talking.</p>
       </section>
@@ -180,20 +217,41 @@
         <label class="slider"><span>Box Line Width</span><input type="range" id="line-w" min="1" max="6" step="0.5" value="2.5"><output id="line-w-v">2.5</output></label>
         <label class="slider"><span>Label Size</span><input type="range" id="label-size" min="10" max="22" step="1" value="13"><output id="label-size-v">13</output></label>
         <label class="check"><input type="checkbox" id="fill-boxes"> <span>Tint Box Interiors</span></label>
-        <label class="check"><input type="checkbox" id="mirror-cam" checked> <span>Mirror Front Camera Preview</span></label>
+      </section>
+
+      <section class="pane" data-pane="devices" hidden>
+        <h3>Camera &amp; Microphone</h3>
+        <p class="muted">Choose the camera the Webcam button opens and the microphone Speak listens to. The choice is saved in this browser.</p>
+        <div class="banner" id="dev-note" hidden></div>
+        <button class="btn primary dev-allow" id="dev-allow" hidden><svg><use href="#i-shield"/></svg>Allow Camera &amp; Microphone</button>
+        <div class="dev-grid">
+          <div class="dev-block">
+            <label class="dev-label" for="cam-select"><svg><use href="#i-webcam"/></svg>Camera</label>
+            <select id="cam-select"></select>
+            <div class="dev-preview"><video id="dev-video" playsinline muted hidden></video><span class="muted small" id="dev-video-note">No preview yet</span></div>
+            <label class="check"><input type="checkbox" id="mirror-cam" checked> <span>Mirror Front Camera Preview</span></label>
+          </div>
+          <div class="dev-block">
+            <label class="dev-label" for="mic-select"><svg><use href="#i-mic"/></svg>Microphone</label>
+            <select id="mic-select"></select>
+            <div class="dev-meter" title="Input level"><span id="dev-level"></span></div>
+            <span class="muted small" id="dev-mic-note">Say something to check the level.</span>
+          </div>
+        </div>
       </section>
 
       <section class="pane" data-pane="about" hidden>
         <h3>About</h3>
         <p><b>Neat DINO Studio</b> runs <a href="https://huggingface.co/IDEA-Research/grounding-dino-base" target="_blank" rel="noopener">Grounding DINO (base)</a>
-          on the SiMa.ai Modalix MLA. The network is compiled into 30 MLA programs; between them the board's CPU does the
+          on the SiMa.ai Modalix MLA. The network is compiled into 30 MLA ELFs; between them the board's CPU does the
           deformable-attention sampling, the top-900 query selection and the box updates. In Live mode two frames are in
           flight: one on the MLA while the CPU samples the other.</p>
         <p class="muted small" id="about-status"></p>
         <p class="muted small">Model: <a href="https://huggingface.co/IDEA-Research/grounding-dino-base" target="_blank" rel="noopener">IDEA-Research/grounding-dino-base</a>
-          — Swin-B image backbone, BERT Base text encoder, 6-layer deformable encoder and decoder, 900 queries, 232 M parameters,
-          compiled to bf16. Fast runs it at 576×576 px, Accurate at 768×768 px (letterboxed).</p>
+          — Grounding DINO <b>Base</b>, 232.3 M parameters in total: Swin-B image backbone (86.9 M), BERT Base text encoder (108.9 M),
+          6-layer deformable encoder and decoder with 900 queries and the heads (36.5 M). Original weights, compiled to bf16. Fast runs it at 576×576 px, Accurate at 768×768 px (letterboxed).</p>
         <p class="muted small">Grounding DINO © IDEA Research, Apache-2.0. This app is Apache-2.0.</p>
+        <p class="muted small" id="sample-credits"></p>
       </section>
     </div>
   </div>

@@ -84,16 +84,16 @@ def model_info(name: str | None, manifest: dict | None = None) -> dict | None:
     if m.get("kind") == "text" or "text" in name:
         return {"name": name, "kind": "text", "title": f"{FAMILY} · Text Encoder (BERT Base)",
                 "short": "Text Encoder", "precision": prec, "upstream": UPSTREAM,
-                "details": f"BERT Base (110 M parameters) + projection · 64 text tokens · {prec} · 1 MLA program"}
-    programs = len(m.get("stages", [])) + sum(1 for st in m.get("backbone", []) if st.get("op") == "run")
+                "details": f"BERT Base (110 M parameters) + projection · 64 text tokens · {prec} · 1 ELF"}
+    elfs = len(m.get("stages", [])) + sum(1 for st in m.get("backbone", []) if st.get("op") == "run")
     speed = SPEED.get(size, "")
     pl = PREC_LABEL.get(prec, prec)
     how = {"w8a16": "int8 weights for the backbone and encoder, bf16 activations"}.get(prec, prec)
     return {"name": name, "kind": "detector", "size": size, "precision": prec, "upstream": UPSTREAM,
             "title": f"{FAMILY} · {speed} {size} px · {pl}".replace("  ", " "),
             "short": f"DINO-B {size}" + (" int8" if prec == "w8a16" else ""),
-            "details": f"{UPSTREAM} · Swin-B + BERT Base, 232 M parameters · {size}×{size} input · {how}"
-                       + (f" · {programs} MLA programs + text encoder" if programs else "")}
+            "details": f"{UPSTREAM} · Grounding DINO Base, 232.3 M parameters (Swin-B + BERT Base) · {size}×{size} input · {how}"
+                       + (f" · {elfs} ELFs + text encoder" if elfs else "")}
 
 
 def stage_label(stage: str) -> str:
@@ -467,7 +467,7 @@ class Studio:
                       "load": "Starting the MLA runtime", "warm": "Warming up (first detection)"}
             label = labels.get(self.stage, self.stage or "")
             if self.stage == "load" and t:
-                label = f"Loading MLA program {min(d + 1, t)} of {t}"
+                label = f"Loading ELF {min(d + 1, t)} of {t}"
             # load is ~90 % of the time; release and warm-up take the ends of the bar
             frac = {"release": 0.02, "unload": None, "warm": 0.95}.get(self.stage)
             if self.stage == "load":
@@ -829,6 +829,13 @@ def create_app(studio: Studio) -> Flask:
                 studio.voice_start((request.get_json(silent=True) or {}).get("llm") or None, who())
             elif action == "stop":
                 studio.voice_stop(who())
+            elif action in ("download", "cancel", "discard"):
+                name = str((request.get_json(silent=True) or {}).get("name") or "")
+                try:
+                    studio.voice.download(action, name)
+                except VoiceError as e:
+                    raise StudioError(str(e)) from e
+                studio._record(f"voice model {action}: {name}", who())
             elif action == "prompt":
                 f = request.files.get("audio")
                 if f is None:

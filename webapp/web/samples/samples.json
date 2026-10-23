@@ -1,0 +1,68 @@
+[
+ {
+  "key": "road-dog",
+  "title": "Road Trip",
+  "prompt": "dog . red bandana . car . potted plant .",
+  "image": "/static/samples/road-dog.jpg",
+  "thumb": "/static/samples/road-dog-thumb.jpg",
+  "source": "http://farm1.staticflickr.com/9/13918737_12ed28cb16_z.jpg",
+  "coco_id": 78823,
+  "license": "Attribution License",
+  "license_url": "http://creativecommons.org/licenses/by/2.0/"
+ },
+ {
+  "key": "boat-dog",
+  "title": "Out On The Water",
+  "prompt": "dog . person . boat . sunglasses .",
+  "image": "/static/samples/boat-dog.jpg",
+  "thumb": "/static/samples/boat-dog-thumb.jpg",
+  "source": "http://farm7.staticflickr.com/6118/6216901971_786976ff66_z.jpg",
+  "coco_id": 190140,
+  "license": "Attribution License",
+  "license_url": "http://creativecommons.org/licenses/by/2.0/"
+ },
+ {
+  "key": "pizza",
+  "title": "Pizza Night",
+  "prompt": "pizza . bottle . cup . newspaper .",
+  "image": "/static/samples/pizza.jpg",
+  "thumb": "/static/samples/pizza-thumb.jpg",
+  "source": "http://farm7.staticflickr.com/6155/6165978029_81ac06fbe3_z.jpg",
+  "coco_id": 194724,
+  "license": "Attribution License",
+  "license_url": "http://creativecommons.org/licenses/by/2.0/"
+ },
+ {
+  "key": "cows",
+  "title": "In The Field",
+  "prompt": "cow .",
+  "image": "/static/samples/cows.jpg",
+  "thumb": "/static/samples/cows-thumb.jpg",
+  "source": "http://farm7.staticflickr.com/6135/5922506927_b60c053513_z.jpg",
+  "coco_id": 402992,
+  "license": "Attribution License",
+  "license_url": "http://creativecommons.org/licenses/by/2.0/"
+ },
+ {
+  "key": "bird",
+  "title": "Yellow Bird",
+  "prompt": "yellow bird .",
+  "image": "/static/samples/bird.jpg",
+  "thumb": "/static/samples/bird-thumb.jpg",
+  "source": "http://farm6.staticflickr.com/5523/9556185989_32d49ca90f_z.jpg",
+  "coco_id": 309452,
+  "license": "Attribution License",
+  "license_url": "http://creativecommons.org/licenses/by/2.0/"
+ },
+ {
+  "key": "beach-horses",
+  "title": "Beach Ride",
+  "prompt": "horse . person . white hat .",
+  "image": "/static/samples/beach-horses.jpg",
+  "thumb": "/static/samples/beach-horses-thumb.jpg",
+  "source": "http://farm5.staticflickr.com/4112/5022207571_74aab92fd5_z.jpg",
+  "coco_id": 7281,
+  "license": "Attribution License",
+  "license_url": "http://creativecommons.org/licenses/by/2.0/"
+ }
+]

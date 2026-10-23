@@ -63,10 +63,13 @@ async function refreshStatus() {
     S.status = await api("/api/status");
   } catch (e) {
     S.status = null;
+    $("#hero-model-text").textContent = "Studio server not answering";
+    $("#hero-model").className = "hero-model error";
   }
   renderStatus();
   clearTimeout(refreshStatus.t);
-  const loading = S.status && (S.status.state === "loading" || (S.status.voice && S.status.voice.state === "loading"));
+  const vs = S.status && S.status.voice;
+  const loading = S.status && (S.status.state === "loading" || (vs && (vs.state === "loading" || (vs.models || []).some((m) => m.job))));
   refreshStatus.t = setTimeout(refreshStatus, loading ? 800 : 4000);
 }
 
@@ -86,6 +89,7 @@ function renderStatus() {
   const narrow = matchMedia("(max-width: 600px)").matches;
   $("#model-pill").title = info ? `${info.title}\n${info.details}` : "Models";
   $("#det-model").textContent = info && st.state === "ready" ? info.title : "";
+  $("#chip-model").textContent = info && st.state === "ready" ? info.short || info.title : "";
   if (st.state === "ready") {
     dot.classList.add("ready");
     name.textContent = narrow ? info.short : info.title;
@@ -104,6 +108,11 @@ function renderStatus() {
     name.textContent = "No Model";
     showBanner("No model is loaded. Load one in Settings → Models to start detecting.", false, "Open Models");
   }
+  const hm = $("#hero-model"), hmt = $("#hero-model-text");
+  hm.className = "hero-model " + ({ ready: "ready", loading: "loading", unloading: "loading", error: "error" }[st.state] || "");
+  hmt.textContent = st.state === "ready" ? `${narrow ? info.short : info.title} · Ready`
+    : st.state === "loading" ? `Loading ${info ? info.short : "the model"}…`
+    : st.state === "error" ? "Model failed to load · Open Models" : "No model loaded · Open Models";
   $("#about-status").textContent = `Server ${st.version}, backend ${st.backend}` + (st.size ? `, input ${st.size} px` : "") +
     (st.load_seconds ? `, loaded in ${st.load_seconds} s` : "");
   renderVoice();
@@ -217,6 +226,44 @@ function renderPhraseChips(phrases, counts) {
   });
 }
 
+// Landing-page samples: COCO val2017 photos under CC BY 2.0 (credits in samples.json and About).
+async function renderSamples() {
+  let list = [];
+  try {
+    list = await (await fetch("/static/samples/samples.json")).json();
+  } catch (e) {
+    return;
+  }
+  const box = $("#samples");
+  box.innerHTML = "";
+  for (const s of list) {
+    const b = document.createElement("button");
+    b.className = "sample";
+    b.title = `Find ${s.prompt}`;
+    b.innerHTML = `<img alt="" loading="lazy" decoding="async"><span class="s-cap"><b></b><code></code></span>`;
+    b.querySelector("img").src = s.thumb;
+    b.querySelector("b").textContent = s.title;
+    b.querySelector("code").textContent = s.prompt;
+    b.onclick = () => useSample(s);
+    box.append(b);
+  }
+  const cred = $("#sample-credits");
+  cred.innerHTML = "Sample photos: COCO val2017 (Flickr), " + list.map((s) =>
+    `<a href="${esc(s.source)}" target="_blank" rel="noopener">${esc(s.title)}</a>`).join(", ") +
+    ` — <a href="https://creativecommons.org/licenses/by/2.0/" target="_blank" rel="noopener">CC BY 2.0</a>, resized.`;
+}
+
+async function useSample(s) {
+  try {
+    const blob = await (await fetch(s.image)).blob();
+    promptEl().value = s.prompt;
+    parsePrompt();
+    await useFile(new File([blob], s.key + ".jpg", { type: "image/jpeg" }));
+  } catch (e) {
+    toast(`Could not open the sample: ${e.message}`, true);
+  }
+}
+
 function renderExamples() {
   const box = $("#examples");
   const hist = store.get("history", []);
@@ -322,8 +369,8 @@ async function detect(opts = {}) {
       S.lastShownT = now;
       if (S.fps.length > 10) S.fps.shift();
       const avg = S.fps.reduce((a, b) => a + b, 0) / S.fps.length;
-      $("#fps").textContent = `${(1000 / avg).toFixed(1)} FPS`;
-      $("#fps").title = `${Math.round(avg)} ms between results, ${Math.round(r.timing.server_total)} ms per frame on the board`;
+      $("#fps").innerHTML = `${(1000 / avg).toFixed(1)}<small>FPS</small>`;
+      $("#mi-fps").title = `${Math.round(avg)} ms between results, ${Math.round(r.timing.server_total)} ms per frame on the board`;
     }
     S.result = r;
     if (!S.cam) S.imageId = r.image_id;
@@ -352,35 +399,34 @@ function setBusy(on) {
   $("#detect-btn").disabled = on && !S.live;
 }
 
+// Top metric strip: total, then the time split into the model's main parts.
+const PART_KEYS = {
+  text: ["text"], backbone: ["backbone", "backbone_cpu"], encoder: ["encoder_mla", "encoder_cpu"],
+  decoder: ["dec_values", "topk", "decoder_mla", "decoder_cpu"],
+};
 function renderTiming(t) {
-  const bar = $("#timing");
-  bar.hidden = false;
-  bar.innerHTML = "";
-  const total = t.server_total || t.total || 1;
-  for (const [k, label, color] of TIMING_PARTS) {
-    if (!t[k]) continue;
-    const s = document.createElement("span");
-    s.style.flex = `${t[k]} 0 0`;
-    s.style.background = color;
-    s.title = `${label}: ${t[k].toFixed(1)} ms`;
-    if (t[k] / total > 0.09) s.textContent = `${label} ${Math.round(t[k])}`;
-    bar.append(s);
+  $("#chipbar").hidden = false;
+  const total = t.server_total || t.total || 0;
+  const label = Object.fromEntries(TIMING_PARTS.map(([k, l]) => [k, l]));
+  const fmt = (ms) => `${Math.round(ms)}<small>ms</small>`;
+  let shown = 0;
+  for (const [part, keys] of Object.entries(PART_KEYS)) {
+    const ms = keys.reduce((a, k) => a + (t[k] || 0), 0);
+    shown += ms;
+    const el = $(`#mp-${part}`);
+    el.classList.toggle("idle", !ms);
+    el.querySelector(".metric-value").innerHTML = ms ? fmt(ms) : part === "text" ? "cached" : "—";
+    el.title = el.title.split("\n")[0] + (ms ? "\n" + keys.filter((k) => t[k]).map((k) => `${label[k]}: ${t[k].toFixed(1)} ms`).join("\n") : "");
   }
-  const shown = TIMING_PARTS.reduce((a, [k]) => a + (t[k] || 0), 0);
-  const other = total - shown;
-  if (other > total * 0.03) {
-    const s = document.createElement("span");
-    s.style.flex = `${other} 0 0`;
-    s.style.background = "#5b6573";
-    s.title = `Other (model, transfer, post-processing): ${other.toFixed(1)} ms`;
-    if (other / total > 0.09) s.textContent = `Other ${Math.round(other)}`;
-    bar.append(s);
-  }
-  const tot = document.createElement("span");
-  tot.className = "total";
-  tot.textContent = `${Math.round(total)} ms`;
-  tot.title = "Server time for this request";
-  bar.append(tot);
+  const other = Math.max(0, total - shown);
+  $("#mp-other .metric-value").innerHTML = total ? fmt(other) : "—";
+  $("#m-total").innerHTML = total ? fmt(total) : "—";
+  if (!S.live) flash($("#m-total").parentElement);
+}
+function flash(el) {
+  el.classList.add("flash");
+  clearTimeout(el._flash);
+  el._flash = setTimeout(() => el.classList.remove("flash"), 600);
 }
 
 // --------------------------------------------------------------------- drawing
@@ -495,10 +541,7 @@ async function openCam() {
   }
   try {
     stopCam();
-    const want = { width: { ideal: 1280 }, height: { ideal: 720 } };
-    if (S.deviceId) want.deviceId = { exact: S.deviceId };
-    else want.facingMode = S.facing;
-    const stream = await navigator.mediaDevices.getUserMedia({ video: want, audio: false });
+    const stream = await getCamStream();
     const v = $("#video");
     v.srcObject = stream;
     await v.play();
@@ -506,9 +549,7 @@ async function openCam() {
     S.imageBlob = null;
     S.imageId = null;
     S.result = null;
-    const track = stream.getVideoTracks()[0];
-    const facing = (track.getSettings && track.getSettings().facingMode) || "";
-    v.classList.toggle("mirror", $("#mirror-cam").checked && facing !== "environment");
+    v.classList.toggle("mirror", shouldMirror(stream));
     showViewer("video");
     v.onloadedmetadata = fitOverlay;
     setTimeout(fitOverlay, 300);
@@ -523,6 +564,39 @@ async function openCam() {
   }
 }
 
+// Camera and microphone choices (Settings → Devices). An unplugged choice falls back to the default device.
+function camWant() {
+  const want = { width: { ideal: 1280 }, height: { ideal: 720 } };
+  const id = store.get("cam-device", "");
+  if (id) want.deviceId = { exact: id };
+  else want.facingMode = S.facing;
+  return want;
+}
+function micWant() {
+  const want = { echoCancellation: true, noiseSuppression: true, autoGainControl: true };
+  const id = store.get("mic-device", "");
+  if (id) want.deviceId = { exact: id };
+  return want;
+}
+async function withFallback(kind, want) {
+  try {
+    return await navigator.mediaDevices.getUserMedia({ [kind]: want });
+  } catch (e) {
+    if (!want.deviceId || !["OverconstrainedError", "NotFoundError"].includes(e.name)) throw e;
+    delete want.deviceId;
+    if (kind === "video") want.facingMode = S.facing;
+    toast(`The chosen ${kind === "video" ? "camera" : "microphone"} isn't connected, so the default one is used.`);
+    return navigator.mediaDevices.getUserMedia({ [kind]: want });
+  }
+}
+const getCamStream = () => withFallback("video", camWant());
+const getMicStream = () => withFallback("audio", micWant());
+function shouldMirror(stream) {
+  const track = stream && stream.getVideoTracks()[0];
+  const facing = (track && track.getSettings && track.getSettings().facingMode) || "";
+  return $("#mirror-cam").checked && facing !== "environment";
+}
+
 function stopCam() {
   stopLive();
   if (S.cam) S.cam.getTracks().forEach((t) => t.stop());
@@ -531,27 +605,29 @@ function stopCam() {
   $("#cam-btn").innerHTML = '<svg><use href="#i-webcam"/></svg>Webcam';
 }
 
-async function grabFrame() {
+// A camera frame at the model's input size (what Live sends), or at the camera's full resolution.
+async function grabFrame(full = false) {
   const v = $("#video");
   const size = (S.status && S.status.size) || 768;
-  const s = Math.min(1, size / Math.max(v.videoWidth, v.videoHeight));
+  const s = full ? 1 : Math.min(1, size / Math.max(v.videoWidth, v.videoHeight));
   const c = document.createElement("canvas");
   c.width = Math.round(v.videoWidth * s);
   c.height = Math.round(v.videoHeight * s);
   c.getContext("2d").drawImage(v, 0, 0, c.width, c.height);
-  return await new Promise((r) => c.toBlob(r, "image/jpeg", 0.88));
+  return await new Promise((r) => c.toBlob(r, "image/jpeg", full ? 0.95 : 0.88));
 }
 
+// Show the snapshot at full camera resolution; the board gets a copy at the model's size, as for uploads.
 async function snapshot() {
   if (!S.cam) return;
-  const blob = await grabFrame();
-  const url = URL.createObjectURL(blob);
+  const photo = await grabFrame(true);
+  const url = URL.createObjectURL(photo);
   stopCam();
   const img = $("#photo");
   img.onload = () => { S.sourceW = img.naturalWidth; S.sourceH = img.naturalHeight; fitOverlay(); };
   img.src = url;
   showViewer("photo");
-  S.imageBlob = blob;
+  S.imageBlob = await downscale(photo);
   S.imageId = null;
   detect();
 }
@@ -583,7 +659,7 @@ function startLive() {
   S.fps = [];
   $("#live-btn").classList.add("on");
   $("#live-btn span").textContent = "Stop Live";
-  $("#fps").hidden = false;
+  $("#mi-fps").hidden = false;
   $("#fps").textContent = "…";
   liveLoop();
 }
@@ -592,13 +668,14 @@ function stopLive(why) {
   S.live = false;
   $("#live-btn").classList.remove("on");
   $("#live-btn span").textContent = "Go Live";
-  $("#fps").hidden = true;
+  $("#mi-fps").hidden = true;
   if (why) toast(why, true);
 }
 
 // --------------------------------------------------------------------- voice
 const V = { rec: null, stream: null, chunks: [], t0: 0, held: 0, timer: null, ctx: null, key: "" };
 const MAX_REC_S = 15;
+const NO_SPEECH_S = 5;          // a click that never hears speech gives up after this long
 
 function voiceLine(html, cls = "") {
   const el = $("#voice-line");
@@ -616,15 +693,18 @@ async function micDown(e) {
   if (!vs || vs.state !== "ready") {
     if (vs && vs.state === "loading") return toast("Voice is still loading…");
     if (!vs || !vs.can_start) return openSettings("voice");
-    if (await confirmBox("Turn on voice? This loads Whisper and a small LLM on the MLA (a few seconds), next to the detector.", "Turn On"))
+    const what = (vs.choices || []).length ? "Whisper and a small LLM" : "Whisper";
+    if (await confirmBox(`Turn on voice? This loads ${what} on the MLA (a few seconds), next to the detector.`, "Turn On"))
       startVoice();
     return;
   }
+  V.holding = true;
   await startRec();
   V.held = performance.now();
 }
 function micUp() {
-  // held for a while = push-to-talk (release stops); a quick click keeps recording until the next click
+  // held for a while = push-to-talk (release stops); a quick click records until a pause or the next click
+  V.holding = false;
   if (V.rec && performance.now() - V.held > 400) stopRec();
 }
 
@@ -632,7 +712,7 @@ async function startRec() {
   if (!navigator.mediaDevices || !window.MediaRecorder)
     return toast("This browser can't record here. Open the studio over HTTPS.", true);
   try {
-    V.stream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true } });
+    V.stream = await getMicStream();
   } catch (e) {
     return toast("Microphone not available: " + e.message, true);
   }
@@ -645,27 +725,56 @@ async function startRec() {
   V.t0 = performance.now();
   $("#mic-btn").classList.add("rec");
   $("#mic-btn .mic-t").textContent = "Stop";
-  voiceLine(`<span class="lvl"><span></span></span><span>Listening… <b class="secs">0.0</b> s</span>`);
-  let lvl = null;
+  voiceLine(`<span class="lvl"><span></span></span><span><span class="what">Listening…</span> <b class="secs">0.0</b> s</span>`);
+  let rms = null;
   try {
     V.ctx = new AudioContext();
     const an = V.ctx.createAnalyser();
-    an.fftSize = 512;
+    an.fftSize = 1024;
     V.ctx.createMediaStreamSource(V.stream).connect(an);
-    const buf = new Uint8Array(an.fftSize);
-    lvl = () => {
-      an.getByteTimeDomainData(buf);
-      let m = 0;
-      for (const v of buf) m = Math.max(m, Math.abs(v - 128));
-      return Math.min(1, m / 64);
+    const buf = new Float32Array(an.fftSize);
+    rms = () => {
+      an.getFloatTimeDomainData(buf);
+      let s = 0;
+      for (const v of buf) s += v * v;
+      return Math.sqrt(s / buf.length);
     };
-  } catch (e) { /* no level meter */ }
+  } catch (e) { /* no level meter and no auto-stop */ }
+  // End of speech: learn the room's noise for the first moments, call it speech when the level is
+  // well above that, and stop after a pause once something was said (not while the button is held).
+  const autostop = $("#voice-autostop").checked, pause = +$("#voice-pause").value;
+  const vad = { floor: null, voiced: 0, spoke: false, quietSince: null };
+  V.noSpeech = false;
   V.timer = setInterval(() => {
-    const t = (performance.now() - V.t0) / 1000;
-    const sec = $("#voice-line .secs"), bar = $("#voice-line .lvl span");
+    const now = performance.now(), t = (now - V.t0) / 1000;
+    const sec = $("#voice-line .secs"), bar = $("#voice-line .lvl span"), what = $("#voice-line .what");
     if (sec) sec.textContent = t.toFixed(1);
-    if (bar && lvl) bar.style.width = `${Math.round(lvl() * 100)}%`;
-    if (t >= MAX_REC_S) stopRec();
+    const r = rms ? rms() : 0;
+    if (bar && rms) bar.style.width = `${Math.round(Math.min(1, r * 8) * 100)}%`;
+    if (t >= MAX_REC_S) return stopRec();
+    if (!rms || !autostop) return;
+    if (t < 0.25) {                                   // noise floor from the start of the recording
+      vad.floor = vad.floor == null ? r : Math.min(vad.floor, r);
+      return;
+    }
+    const on = Math.min(0.06, Math.max(0.012, (vad.floor || 0) * 3));  // speech threshold
+    if (r > on) {
+      vad.voiced += 80;
+      vad.quietSince = null;
+      if (vad.voiced >= 160 && !vad.spoke) {
+        vad.spoke = true;
+        if (what) what.textContent = "Hearing you…";
+      }
+    } else {
+      if (vad.quietSince == null) vad.quietSince = now;
+      if (!vad.spoke) vad.floor = vad.floor * 0.95 + r * 0.05;   // keep learning until speech starts
+    }
+    if (V.holding) return;
+    if (vad.spoke && vad.quietSince != null && (now - vad.quietSince) / 1000 >= pause) stopRec();
+    else if (!vad.spoke && t >= NO_SPEECH_S) {
+      V.noSpeech = true;
+      stopRec();
+    }
   }, 80);
 }
 
@@ -682,6 +791,7 @@ function stopRec() {
 }
 
 async function sendRec() {
+  if (V.noSpeech) return voiceLine("Didn’t hear anything. Click Speak and say what to find.", "err");
   if (V.dur < 0.4) return voiceLine("Too short. Hold Speak while you talk, or click once to start and again to stop.", "err");
   const type = (V.chunks[0] && V.chunks[0].type) || "audio/webm";
   const blob = new Blob(V.chunks, { type });
@@ -724,6 +834,58 @@ async function startVoice() {
   refreshStatus();
 }
 
+// Whisper and the LLMs, downloaded from Hugging Face (simaai/...) into the shared LLiMa folder.
+function renderVoiceModels(vs) {
+  const list = $("#voice-models");
+  const models = vs.models || [];
+  $("#voice-models-line").innerHTML = `Precompiled LLiMa models from <a href="https://huggingface.co/simaai" target="_blank" rel="noopener">simaai</a> on Hugging Face,
+    kept in <code>${esc(vs.models_dir || "")}</code> next to the other LLiMa models (GenAI Studio uses the same ones).`;
+  const busy = models.some((m) => m.job);
+  list.innerHTML = "";
+  for (const m of models) {
+    const el = document.createElement("div");
+    el.className = "model";
+    const tag = m.present ? '<span class="tag on">On Board</span>' : m.job ? '<span class="tag live">Downloading</span>' : "";
+    el.innerHTML = `<div class="name"><span></span><span class="tag">${m.role === "asr" ? "Speech" : "LLM"}</span>${tag}</div>
+      <div class="meta"></div><div class="actions"></div>`;
+    el.querySelector(".name span").textContent = m.title;
+    el.querySelector(".meta").textContent = `${m.size} · ${m.note}`;
+    const act = el.querySelector(".actions");
+    const btn = (label, icon, action, cls = "", disabled = false) => {
+      const b = document.createElement("button");
+      b.className = "btn " + cls;
+      b.disabled = disabled;
+      b.innerHTML = `<svg><use href="#i-${icon}"/></svg>${label}`;
+      b.onclick = async () => {
+        try { await post(`/api/voice/${action}`, { name: m.name }); } catch (e) { toast(e.message, true); }
+        refreshStatus();
+      };
+      act.append(b);
+    };
+    if (m.job) btn("Cancel", "close", "cancel");
+    else if (!m.present) {
+      btn(m.partial ? "Resume" : "Download", "download", "download", "primary", busy);
+      if (m.partial) btn("Discard", "trash", "discard");
+    }
+    if (m.job) {
+      const p = m.job, pr = document.createElement("div");
+      pr.className = "prog";
+      pr.innerHTML = `<div class="bar"><span style="width:${(p.fraction * 100).toFixed(1)}%"></span></div><div class="txt"></div>`;
+      pr.querySelector(".txt").textContent = p.stage === "listing" ? "Asking Hugging Face for the file list…"
+        : `${fmtBytes(p.done_bytes)} of ${fmtBytes(p.total_bytes)} · ${fmtBytes(p.bytes_per_second)}/s` +
+          (p.seconds_left != null ? ` · ${Math.ceil(p.seconds_left / 60)} min left` : "");
+      el.append(pr);
+    }
+    if (m.error) {
+      const e = document.createElement("div");
+      e.className = "err";
+      e.textContent = m.error;
+      el.append(e);
+    }
+    list.append(el);
+  }
+}
+
 function renderVoice() {
   const vs = S.status && S.status.voice;
   const mic = $("#mic-btn");
@@ -731,7 +893,8 @@ function renderVoice() {
   mic.classList.toggle("off", vs.state !== "ready");
   mic.title = vs.state === "ready" ? "Speak what to find: hold to talk, or click to start and stop"
     : vs.state === "loading" ? "Voice is loading…" : "Voice is off: click to turn it on";
-  const key = JSON.stringify([vs.state, vs.llm, vs.choices, vs.error, vs.can_start]);
+  renderVoiceModels(vs);
+  const key = JSON.stringify([vs.state, vs.llm, vs.choices, vs.error, vs.can_start, vs.python]);
   const card = $("#voice-card");
   const tm = card.querySelector(".v-time");
   if (tm && vs.state === "loading" && vs.elapsed != null) tm.textContent = `${Math.round(vs.elapsed)} s`;
@@ -752,8 +915,10 @@ function renderVoice() {
     ${vs.state === "loading" ? '<div class="prog"><div class="pbar indeterminate"><span></span></div><div class="txt">Loading Whisper and the LLM on the MLA… <span class="v-time"></span></div></div>' : ""}
     ${vs.error ? `<div class="err">${esc(vs.error)}</div>` : ""}
   </div>`;
-  card.querySelector(".meta").textContent = !vs.can_start
-    ? "Needs pyneat and the LLiMa models (whisper-small-a16w8) in /media/nvme/llima/models."
+  card.querySelector(".meta").textContent = !vs.python
+    ? "Needs pyneat (~/pyneat) to run Whisper and the LLM on the MLA."
+    : !vs.can_start ? "Download Whisper Small below to turn voice on."
+    : vs.state !== "ready" && !(vs.choices || []).length ? "Speech to text: Whisper Small (a16w8). No LLM downloaded, so simple rules turn requests into phrases."
     : vs.state === "ready" ? `Whisper Small (a16w8)${vs.llm ? " · " + (vs.llm_title || vs.llm) : " · no LLM (rules)"} · loaded in ${vs.load_seconds} s`
       : "Speech to text: Whisper Small (a16w8). Request to phrases: the LLM chosen here.";
   const on = $("#voice-on"), off = $("#voice-off");
@@ -771,6 +936,127 @@ function openSettings(pane = "models") {
   const d = $("#settings");
   if (!d.open) d.showModal();
   if (pane === "models") refreshModels();
+  if (pane === "devices") renderDevices();
+  else stopDevicePreview();
+}
+
+// --------------------------------------------------------------------- devices pane
+const DEV = { cam: null, mic: null, ctx: null, raf: 0, gen: 0 };
+
+function stopDevicePreview() {
+  DEV.gen++;
+  if (DEV.cam) DEV.cam.getTracks().forEach((t) => t.stop());
+  if (DEV.mic) DEV.mic.getTracks().forEach((t) => t.stop());
+  if (DEV.ctx) DEV.ctx.close().catch(() => {});
+  cancelAnimationFrame(DEV.raf);
+  Object.assign(DEV, { cam: null, mic: null, ctx: null });
+  const v = $("#dev-video");
+  v.srcObject = null;
+  v.hidden = true;
+  $("#dev-video-note").textContent = "No preview yet";
+  $("#dev-level").style.width = "0";
+}
+
+function fillDevices(sel, devs, cur, auto, kind) {
+  sel.innerHTML = "";
+  sel.append(new Option(auto, ""));
+  devs.forEach((d, i) => sel.append(new Option(d.label || `${kind} ${i + 1}`, d.deviceId)));
+  if (cur && !devs.some((d) => d.deviceId === cur)) sel.append(new Option(`Saved ${kind} (Not Connected)`, cur));
+  sel.value = cur;
+}
+
+async function renderDevices() {
+  stopDevicePreview();
+  const gen = DEV.gen, note = $("#dev-note");
+  note.hidden = true;
+  if (!camSupported()) {
+    note.hidden = false;
+    note.textContent = "Browsers only give secure (HTTPS) pages access to cameras and microphones. Open this studio with https:// to choose them.";
+    ["#cam-select", "#mic-select"].forEach((s) => { $(s).innerHTML = ""; $(s).disabled = true; });
+    $("#dev-allow").hidden = true;
+    return;
+  }
+  const all = await navigator.mediaDevices.enumerateDevices();
+  if (gen !== DEV.gen) return;
+  // Chrome lists "default" and "communications" aliases next to the real microphones; "" ids mean no permission yet.
+  const cams = all.filter((d) => d.kind === "videoinput" && d.deviceId);
+  const mics = all.filter((d) => d.kind === "audioinput" && d.deviceId && !["default", "communications"].includes(d.deviceId));
+  const named = all.some((d) => d.label);
+  $("#dev-allow").hidden = named;
+  ["#cam-select", "#mic-select"].forEach((s) => ($(s).disabled = !named));
+  fillDevices($("#cam-select"), cams, store.get("cam-device", ""), "Automatic (Back Camera On Phones)", "Camera");
+  fillDevices($("#mic-select"), mics, store.get("mic-device", ""), "System Default", "Microphone");
+  if (!named) {
+    $("#dev-video-note").textContent = "Allow access to see your cameras";
+    $("#dev-mic-note").textContent = "Allow access to see your microphones.";
+    return;
+  }
+  startCamPreview(gen);
+  startMicMeter(gen);
+}
+
+async function startCamPreview(gen) {
+  const v = $("#dev-video"), note = $("#dev-video-note");
+  let stream = S.cam;                          // the webcam is already open: show it rather than open it twice
+  if (!stream) {
+    note.textContent = "Starting camera…";
+    try {
+      stream = await getCamStream();
+    } catch (e) {
+      if (gen === DEV.gen) note.textContent = e.name === "NotFoundError" ? "No camera found" : `Camera unavailable: ${e.message}`;
+      return;
+    }
+    if (gen !== DEV.gen) return stream.getTracks().forEach((t) => t.stop());
+    DEV.cam = stream;
+  }
+  v.srcObject = stream;
+  v.classList.toggle("mirror", shouldMirror(stream));
+  v.hidden = false;
+  v.play().catch(() => {});
+}
+
+async function startMicMeter(gen) {
+  const note = $("#dev-mic-note");
+  let stream;
+  try {
+    stream = await getMicStream();
+  } catch (e) {
+    if (gen === DEV.gen) note.textContent = e.name === "NotFoundError" ? "No microphone found." : `Microphone unavailable: ${e.message}`;
+    return;
+  }
+  if (gen !== DEV.gen) return stream.getTracks().forEach((t) => t.stop());
+  DEV.mic = stream;
+  note.textContent = "Say something to check the level.";
+  try {
+    DEV.ctx = new AudioContext();
+    const an = DEV.ctx.createAnalyser();
+    an.fftSize = 512;
+    DEV.ctx.createMediaStreamSource(stream).connect(an);
+    const buf = new Uint8Array(an.fftSize), bar = $("#dev-level");
+    const tick = () => {
+      if (gen !== DEV.gen) return;
+      an.getByteTimeDomainData(buf);
+      let m = 0;
+      for (const x of buf) m = Math.max(m, Math.abs(x - 128));
+      bar.style.width = `${Math.min(100, (m / 64) * 100)}%`;
+      DEV.raf = requestAnimationFrame(tick);
+    };
+    tick();
+  } catch (e) {
+    note.textContent = "Level meter unavailable in this browser.";
+  }
+}
+
+async function allowDevices() {
+  for (const kind of ["video", "audio"]) {
+    try {
+      const s = await navigator.mediaDevices.getUserMedia({ [kind]: true });
+      s.getTracks().forEach((t) => t.stop());
+    } catch (e) {
+      if (e.name === "NotAllowedError") toast(`${kind === "video" ? "Camera" : "Microphone"} permission was denied. Allow it in the browser's site settings.`, true);
+    }
+  }
+  renderDevices();
 }
 
 async function refreshModels() {
@@ -898,7 +1184,13 @@ function init() {
     const cur = document.documentElement.getAttribute("data-theme") ||
       (matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light");
     const next = cur === "dark" ? "light" : "dark";
-    document.documentElement.setAttribute("data-theme", next);
+    const root = document.documentElement;
+    if (!matchMedia("(prefers-reduced-motion: reduce)").matches) {
+      root.classList.add("theme-anim");
+      clearTimeout(init.themeT);
+      init.themeT = setTimeout(() => root.classList.remove("theme-anim"), 420);
+    }
+    root.setAttribute("data-theme", next);
     store.set("theme", next);
     try { localStorage.setItem("dino-theme", next); } catch (e) { /* ignore */ }
   };
@@ -906,6 +1198,26 @@ function init() {
   $("#settings-btn").onclick = () => openSettings("models");
   $("#model-pill").onclick = () => openSettings("models");
   $("#settings-close").onclick = () => $("#settings").close();
+  $("#settings").addEventListener("close", stopDevicePreview);
+  $("#dev-allow").onclick = allowDevices;
+  $("#cam-select").onchange = async (e) => {
+    store.set("cam-device", e.target.value);
+    stopDevicePreview();
+    if (S.cam) {                               // switch the open webcam now, and keep Live going
+      const wasLive = S.live;
+      await openCam();
+      if (wasLive && S.cam) startLive();
+    }
+    renderDevices();
+  };
+  $("#mic-select").onchange = (e) => {
+    store.set("mic-device", e.target.value);
+    renderDevices();
+  };
+  if (navigator.mediaDevices && navigator.mediaDevices.addEventListener)
+    navigator.mediaDevices.addEventListener("devicechange", () => {
+      if ($("#settings").open && !$('.pane[data-pane="devices"]').hidden) renderDevices();
+    });
   $$(".nav-item").forEach((b) => (b.onclick = () => openSettings(b.dataset.pane)));
   $("#settings").addEventListener("click", (e) => { if (e.target === $("#settings")) $("#settings").close(); });
   $("#reset-mla").onclick = async () => {
@@ -933,7 +1245,7 @@ function init() {
     if (S.devices.length < 2) return;
     const cur = S.cam.getVideoTracks()[0].getSettings().deviceId;
     const i = S.devices.findIndex((d) => d.deviceId === cur);
-    S.deviceId = S.devices[(i + 1) % S.devices.length].deviceId;
+    store.set("cam-device", S.devices[(i + 1) % S.devices.length].deviceId);
     openCam();
   };
   const stage = $("#stage");
@@ -971,6 +1283,15 @@ function init() {
   window.addEventListener("keyup", (e) => {
     if (e.code === "Space" && V.rec && !typing(document.activeElement)) { e.preventDefault(); stopRec(); }
   });
+  const as = $("#voice-autostop");
+  as.checked = store.get("voice-autostop", true);
+  as.addEventListener("change", () => { store.set("voice-autostop", as.checked); $("#voice-pause").disabled = !as.checked; });
+  $("#voice-pause").disabled = !as.checked;
+  const vp = $("#voice-pause");
+  vp.value = store.get("voice-pause", 0.8);
+  const vpu = () => { $("#voice-pause-v").textContent = `${(+vp.value).toFixed(1)} s`; store.set("voice-pause", vp.value); };
+  vp.addEventListener("input", vpu);
+  vpu();
   const ar = $("#voice-autorun");
   ar.checked = store.get("voice-autorun", true);
   ar.addEventListener("change", () => store.set("voice-autorun", ar.checked));
@@ -1002,7 +1323,12 @@ function init() {
     el.addEventListener("change", () => {
       store.set(id, el.checked);
       if (id === "#nms" && S.result && !S.cam) detect();
-      else draw();
+      else if (id === "#mirror-cam") {
+        if (S.cam) $("#video").classList.toggle("mirror", shouldMirror(S.cam));
+        const dv = $("#dev-video");
+        if (dv.srcObject) dv.classList.toggle("mirror", shouldMirror(dv.srcObject));
+        draw();
+      } else draw();
     });
   }
   $("#reset-thr").onclick = () => {
@@ -1027,7 +1353,23 @@ function init() {
   window.addEventListener("resize", fitOverlay);
   new ResizeObserver(fitOverlay).observe($("#stage"));
 
+  // rail cards fold away from their header; which ones are folded is remembered per browser
+  const folded = new Set(store.get("collapsed", []));
+  $$(".rail .card[data-card]").forEach((card) => {
+    const btn = card.querySelector(".card-toggle"), key = card.dataset.card;
+    const apply = (shut) => { card.classList.toggle("collapsed", shut); btn.setAttribute("aria-expanded", String(!shut)); };
+    apply(folded.has(key));
+    btn.onclick = () => {
+      const shut = !card.classList.contains("collapsed");
+      apply(shut);
+      shut ? folded.add(key) : folded.delete(key);
+      store.set("collapsed", [...folded]);
+    };
+  });
+
   renderExamples();
+  renderSamples();
+  $("#hero-model").onclick = () => openSettings("models");
   refreshStatus().then(parsePrompt);
   if (location.pathname === "/models") openSettings("models");
 }

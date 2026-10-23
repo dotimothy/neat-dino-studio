@@ -26,6 +26,8 @@ import uuid
 from collections import deque
 from pathlib import Path
 
+from app.llima_hub import HubError, LlimaHub
+
 DEFAULT_MODELS = Path(os.environ.get("DINO_LLIMA_MODELS", "/media/nvme/llima/models"))
 ASR_CHOICES = ["whisper-small-a16w8"]
 # Preferred first. Small instruction-following models: the answer is a few words.
@@ -124,6 +126,7 @@ class VoiceService:
         self.load_started = 0.0
         self.load_seconds: float | None = None
         self.log_lines: deque[str] = deque(maxlen=200)
+        self.hub = LlimaHub(self.models_dir, log=self._log)   # downloads into the shared LLiMa folder
 
     @staticmethod
     def _find_python() -> str | None:
@@ -149,7 +152,14 @@ class VoiceService:
                 "llm_title": LLM_TITLES.get(self.llm or "", self.llm), "load_seconds": self.load_seconds,
                 "elapsed": round(time.time() - self.load_started, 1) if self.state == "loading" else None,
                 "can_start": bool(av["asr"] and av["python"]), "choices": av["llm"],
-                "titles": {n: LLM_TITLES.get(n, n) for n in av["llm"]}}
+                "titles": {n: LLM_TITLES.get(n, n) for n in av["llm"]},
+                "python": av["python"], "models_dir": av["models_dir"], "models": self.hub.models()}
+
+    def download(self, action: str, name: str) -> None:
+        try:
+            {"download": self.hub.download, "cancel": self.hub.cancel, "discard": self.hub.discard}[action](name)
+        except HubError as e:
+            raise VoiceError(str(e)) from e
 
     # ---- PromptAssist
     def describe(self) -> dict:
