@@ -63,6 +63,23 @@ the same hops would cost seconds (EV74 tessellation of 1×N token tensors: 5 s p
 | 768 encoders "Check FAILED" | channel softmax over 12 240 channels | exp/sum over two token chunks (exact; scores in −25..15) |
 | "Layer names are not unique" | two identical constants merged by onnxsim | unequal chunk sizes |
 
+## Int8 weights (w8a16): tried, not shipped
+
+The backbone and encoder programs were compiled with int8 weights and bf16 activations (the
+decoder's small programs got no faster, so they stay bf16). At 576 on the board:
+
+| | bf16 | w8a16 |
+|---|---|---|
+| Per image, one at a time | 328 ms | 313 ms (backbone 75 → 68, encoder MLA 74 → 65) |
+| Live, two in flight | 3.88 FPS | 4.03 FPS |
+| COCO AP (500-image subset) | **42.0** | 41.5 |
+| Bundle / load time | 1.8 GB / 3 s | 2.1 GB / 6 s |
+
+The MLA programs are compute- rather than weight-bound here (a Swin stage: 14.7 → 12.4 ms,
+an encoder layer 11.7 → 10.3 ms, a decoder layer 1.25 → 1.36 ms), and the ELFs get larger,
+not smaller. 5 % speed for −0.5 AP and a bigger download is not a good trade, so the hub keeps
+bf16 only. `PREC=w8a16 compile/build_stages.sh` and `make_bundle.py --prec w8a16` still build it.
+
 ## Live mode: two frames in flight
 
 One frame at a time leaves the MLA idle while the CPU samples (112 ms of the 330 ms at 576) and
