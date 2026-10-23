@@ -35,3 +35,8 @@ add_executable(msda_bench tests/msda_bench.cpp)
 target_include_directories(msda_bench PRIVATE include)
 target_link_libraries(msda_bench PRIVATE OpenMP::OpenMP_CXX)
 target_compile_options(msda_bench PRIVATE ${DINO_FLAGS})
+
+add_executable(sam3_host_bench tests/sam3_host_bench.cpp)
+target_include_directories(sam3_host_bench PRIVATE include)
+target_link_libraries(sam3_host_bench PRIVATE OpenMP::OpenMP_CXX)
+target_compile_options(sam3_host_bench PRIVATE ${DINO_FLAGS})

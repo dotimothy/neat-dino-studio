@@ -76,6 +76,8 @@ def export(name, module, inputs: dict, simplify=True):
             np.save(OUT / f"{name}_in_{n}.npy", feed[n])
         (OUT / f"{name}_inputs.txt").write_text("\n".join(names) + "\n")
     np.save(OUT / f"{name}_ref.npy", y)
+    (ROOT / "build" / "calib").mkdir(parents=True, exist_ok=True)      # real calibration for the compile
+    np.savez(ROOT / "build" / "calib" / f"{name}.npz", **feed)
     ops = sorted({n.op_type for n in m.graph.node})
     bad = sorted(set(ops) - ALLOWED)
     params = sum(int(np.prod(i.dims)) for i in m.graph.initializer)
@@ -224,15 +226,19 @@ def build(hf, S_=672):
         h = torch.cat([S.tok(d.presence_token.weight), S.tok(d.query_embed.weight)], 3)
         ref = d.reference_points.weight.sigmoid()
         vis_k = enc + pos
+        Q = d.config.num_queries
         for i, l in enumerate(pipe.dec):
-            qpos = torch.cat([torch.zeros(1, 256, 1, 1), pipe.ref_head(S.tok(S.sine_boxes(d, ref)))], 3)
-            rpb = S.box_rpb(d, ref, G, G)
-            mod = Dec(l).eval()
-            inp = {"h": h, "qpos": qpos, "text": text, "tmask": tmask, "enc": enc, "vis_k": vis_k, "rpb": rpb}
+            # the layer plus its query position, box bias and box head (sam3_mla.DecFull); the CPU
+            # gives it the boxes' sine embedding and log-scaled edge distances
+            dy, dx = S.box_log_deltas(ref, G)
+            mod = S.DecFull(l, hf, G).eval()
+            inp = {"h": h, "qsine": S.tok(S.sine_boxes(d, ref)), "text": text, "tmask": tmask, "enc": enc,
+                   "vis_k": vis_k, "dy": dy, "dx": dx}
             progs.append((f"{pre}_dec{i}", mod, inp))
-            h = mod(*inp.values())
+            out = mod(*inp.values())
+            h = out[:, :, :, :Q + 1]
             q = pipe.out_ln(h[:, :, :, 1:])
-            ref = (torch.logit(ref, eps=1e-3) + S.rows(pipe.box_head(q))).sigmoid()
+            ref = (torch.logit(ref, eps=1e-3) + S.rows(out[:, :4, :, Q + 1:])).sigmoid()
         # masks
         mod = MaskPre(pipe.pca, pipe.pca_ln).eval()
         progs.append((f"{pre}_maskpre", mod, {"enc": enc, "text": text, "tmask": tmask}))

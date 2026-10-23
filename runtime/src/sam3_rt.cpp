@@ -55,7 +55,7 @@ using dino::to_bf16;
 
 namespace sam3 {
 
-constexpr int D = 256;
+constexpr int D = 256, kBiasIn = 16;
 
 static double ms_since(Clock::time_point t) {
   return std::chrono::duration<double, std::milli>(Clock::now() - t).count();
@@ -175,9 +175,11 @@ class Model {
     tmask_ = std::make_unique<Buffer>("tmask", (size_t)T_);
     enc_ = std::make_unique<Buffer>("enc", (size_t)N * D);
     visk_ = std::make_unique<Buffer>("vis_k", (size_t)N * D);
-    for (auto& b : h_) b = std::make_unique<Buffer>("h", (size_t)(Q_ + 1) * D);
-    qpos_ = std::make_unique<Buffer>("qpos", (size_t)(Q_ + 1) * D);
-    rpb_ = std::make_unique<Buffer>("rpb", (size_t)H_ * (Q_ + 1) * N);
+    h0_ = std::make_unique<Buffer>("h0", (size_t)(Q_ + 1) * D);
+    for (auto& b : dout_) b = std::make_unique<Buffer>("dec_out", (size_t)(2 * Q_ + 1) * D);   // [h' | box delta]
+    qsine_ = std::make_unique<Buffer>("qsine", (size_t)Q_ * 512);
+    dy_ = std::make_unique<Buffer>("dy", (size_t)G_ * Q_ * kBiasIn);   // 2 values + zeros (see box_log_deltas)
+    dx_ = std::make_unique<Buffer>("dx", (size_t)G_ * Q_ * kBiasIn);
     e2_ = std::make_unique<Buffer>("e2", (size_t)N * D);
     inst_ = std::make_unique<Buffer>("inst", (size_t)16 * N * D);
 
@@ -212,11 +214,15 @@ class Model {
     add("neck1", {sp_->all()}, {f1_->all()});
     add("text", {tin_->all()}, {text_->all()});
     add("enc", by_name("enc", {{"x", f1_->all()}, {"text", text_->all()}, {"tmask", tmask_->all()}}), {enc_->all()});
+    // decoder layers (with their query position, box bias and box head): layer k reads h from the
+    // first 1 + Q tokens of layer k-1's output, so nothing is copied between layers
     for (int k = 0; k < 6; ++k) {
       const std::string n = "dec" + std::to_string(k);
-      add(n, by_name(n, {{"h", h_[k % 2]->all()}, {"qpos", qpos_->all()}, {"text", text_->all()},
-                         {"tmask", tmask_->all()}, {"enc", enc_->all()}, {"vis_k", visk_->all()}, {"rpb", rpb_->all()}}),
-          {h_[(k + 1) % 2]->all()});
+      llima::MLABufferSlice hin = k == 0 ? h0_->all()
+                                         : llima::MLABufferSlice(&dout_[(k - 1) % 2]->b, {0u, 0u}, {1u, (uint32_t)((Q_ + 1) * D)});
+      add(n, by_name(n, {{"h", hin}, {"qsine", qsine_->all()}, {"text", text_->all()}, {"tmask", tmask_->all()},
+                         {"enc", enc_->all()}, {"vis_k", visk_->all()}, {"dy", dy_->all()}, {"dx", dx_->all()}}),
+          {dout_[k % 2]->all()});
     }
     add("maskpre", by_name("maskpre", {{"enc", enc_->all()}, {"text", text_->all()}, {"tmask", tmask_->all()}}),
         {e2_->all()});
@@ -350,56 +356,30 @@ class Model {
     }
   }
 
-  // box relative position bias in score layout: rpb[(head * (Q+1) + q) * N + key]
-  void box_rpb(const float* ref) {
-    const int N = G_ * G_, Hh = H_, Wd = G_;
-    std::vector<float> by((size_t)Q_ * G_ * Hh), bx((size_t)Q_ * Wd * Hh);
+  // the box bias MLPs' inputs: log-scaled distances from each grid coordinate to the box's two edges,
+  // as (1, 16, G, Q) tensors (HWC: [coordinate][query][edge, then 14 zeros: a 2-channel MLA input
+  // miscompiles]); the MLPs and the expansion run on the MLA. Buffers start cleared, so the zeros stay.
+  void box_log_deltas(const float* ref) {
     auto lg = [](float d) {
       const float v = d * 8.f;
       return (v > 0 ? 1.f : (v < 0 ? -1.f : 0.f)) * std::log2(std::fabs(v) + 1.f) / 3.f;
     };
-    for (int axis = 0; axis < 2; ++axis) {
-      const char* pre = axis == 0 ? "rpb_y" : "rpb_x";
-      const float* W1 = w(std::string(pre) + ".l1.w");
-      const float* B1 = w(std::string(pre) + ".l1.b");
-      const float* W2 = w(std::string(pre) + ".l2.w");
-      const float* B2 = w(std::string(pre) + ".l2.b");
-      float* out = axis == 0 ? by.data() : bx.data();
+    uint16_t* py = dy_->p();
+    uint16_t* px = dx_->p();
 #pragma omp parallel for schedule(static)
+    for (int c = 0; c < G_; ++c) {
+      const float coord = (float)c / G_;
       for (int q = 0; q < Q_; ++q) {
-        const float* b = ref + q * 4;   // cx, cy, w, h
-        const float lo = axis == 0 ? b[1] - b[3] / 2 : b[0] - b[2] / 2;
-        const float hi = axis == 0 ? b[1] + b[3] / 2 : b[0] + b[2] / 2;
-        float hid[256];
-        for (int c = 0; c < G_; ++c) {
-          const float coord = (float)c / G_;
-          const float in0 = lg(coord - lo), in1 = lg(coord - hi);
-          for (int j = 0; j < 256; ++j) hid[j] = std::max(0.f, B1[j] + W1[j * 2] * in0 + W1[j * 2 + 1] * in1);
-          for (int hd = 0; hd < Hh; ++hd) {
-            float s = 0.f;
-            const float* w2 = W2 + hd * 256;
-#pragma omp simd reduction(+ : s)
-            for (int j = 0; j < 256; ++j) s += w2[j] * hid[j];
-            out[((size_t)q * G_ + c) * Hh + hd] = s + B2[hd];
-          }
-        }
+        const float* b = ref + q * 4;
+        const size_t o = ((size_t)c * Q_ + q) * kBiasIn;
+        py[o] = to_bf16(lg(coord - (b[1] - b[3] / 2)));
+        py[o + 1] = to_bf16(lg(coord - (b[1] + b[3] / 2)));
+        px[o] = to_bf16(lg(coord - (b[0] - b[2] / 2)));
+        px[o + 1] = to_bf16(lg(coord - (b[0] + b[2] / 2)));
       }
     }
-    uint16_t* r = rpb_->p();
-#pragma omp parallel for collapse(2) schedule(static)
-    for (int hd = 0; hd < Hh; ++hd)
-      for (int q = 0; q <= Q_; ++q) {
-        uint16_t* row = r + ((size_t)hd * (Q_ + 1) + q) * N;
-        if (q == 0) {
-          std::memset(row, 0, (size_t)N * 2);
-          continue;
-        }
-        for (int y = 0; y < G_; ++y) {
-          const float vy = by[((size_t)(q - 1) * G_ + y) * Hh + hd];
-          for (int x = 0; x < Wd; ++x) row[y * Wd + x] = to_bf16(vy + bx[((size_t)(q - 1) * Wd + x) * Hh + hd]);
-        }
-      }
-    rpb_->flush();
+    dy_->flush();
+    dx_->flush();
   }
 
   std::vector<char> detector(float mask_min) {
@@ -421,45 +401,36 @@ class Model {
       visk_->flush();
     }
     // decoder
-    std::vector<float> ref(w("ref0"), w("ref0") + (size_t)Q_ * 4), sine((size_t)Q_ * 512), hid((size_t)Q_ * D),
-        qp((size_t)Q_ * D), hq((size_t)(Q_ + 1) * D), q((size_t)Q_ * D), t1((size_t)Q_ * D), t2((size_t)Q_ * D),
-        delta((size_t)Q_ * 4);
+    std::vector<float> ref(w("ref0"), w("ref0") + (size_t)Q_ * 4), sine((size_t)Q_ * 512),
+        hq((size_t)(Q_ + 1) * D), q((size_t)Q_ * D), delta((size_t)Q_ * D);
     {
-      uint16_t* h0 = h_[0]->p();
+      uint16_t* h0 = h0_->p();
       for (int c = 0; c < D; ++c) h0[c] = to_bf16(w("presence_token")[c]);
       dino::to_bf16_span(w("query_embed"), h0 + D, (size_t)Q_ * D);
-      h_[0]->flush();
+      h0_->flush();
     }
     double mla = 0;
     for (int k = 0; k < 6; ++k) {
       sine_boxes(ref.data(), sine.data());
-      linear(sine.data(), Q_, 512, w("ref_head.l1.w"), w("ref_head.l1.b"), D, hid.data(), true);
-      linear(hid.data(), Q_, D, w("ref_head.l2.w"), w("ref_head.l2.b"), D, qp.data());
-      std::memset(qpos_->p(), 0, D * 2);
-      dino::to_bf16_span(qp.data(), qpos_->p() + D, (size_t)Q_ * D);
-      qpos_->flush();
-      box_rpb(ref.data());
+      dino::to_bf16_span(sine.data(), qsine_->p(), sine.size());
+      qsine_->flush();
+      box_log_deltas(ref.data());
       auto tm = Clock::now();
-      if (g_dump) {
-        dump("dec" + std::to_string(k) + "_h", *h_[k % 2]);
-        dump("dec" + std::to_string(k) + "_qpos", *qpos_);
-        dump("dec" + std::to_string(k) + "_rpb", *rpb_);
-        dump("visk", *visk_);
-      }
       stages_.at("dec" + std::to_string(k))->run();
-      dump("dec" + std::to_string(k) + "_out", *h_[(k + 1) % 2]);
       mla += ms_since(tm);
-      Buffer& out = *h_[(k + 1) % 2];
+      Buffer& out = *dout_[k % 2];
       out.invalidate();
-      dino::from_bf16_span(out.p(), hq.data(), hq.size());
-      std::memcpy(q.data(), hq.data() + D, (size_t)Q_ * D * 4);
-      layer_norm(q.data(), Q_, D, w("out_ln.w"), w("out_ln.b"), eps_.at("out_ln"));
-      linear(q.data(), Q_, D, w("box_head.l1.w"), w("box_head.l1.b"), D, t1.data(), true);
-      linear(t1.data(), Q_, D, w("box_head.l2.w"), w("box_head.l2.b"), D, t2.data(), true);
-      linear(t2.data(), Q_, D, w("box_head.l3.w"), w("box_head.l3.b"), 4, delta.data());
-      for (int i = 0; i < Q_ * 4; ++i) {
-        const float r = std::min(std::max(ref[i], 1e-3f), 1.f - 1e-3f);
-        ref[i] = 1.f / (1.f + std::exp(-(std::log(r / (1.f - r)) + delta[i])));
+      if (g_dump) dump("dec" + std::to_string(k) + "_out", out);
+      dino::from_bf16_span(out.p() + (size_t)(Q_ + 1) * D, delta.data(), delta.size());
+      for (int i = 0; i < Q_; ++i)
+        for (int j = 0; j < 4; ++j) {
+          const float r = std::min(std::max(ref[i * 4 + j], 1e-3f), 1.f - 1e-3f);
+          ref[i * 4 + j] = 1.f / (1.f + std::exp(-(std::log(r / (1.f - r)) + delta[(size_t)i * D + j])));
+        }
+      if (k == 5) {
+        dino::from_bf16_span(out.p(), hq.data(), hq.size());
+        std::memcpy(q.data(), hq.data() + D, (size_t)Q_ * D * 4);
+        layer_norm(q.data(), Q_, D, w("out_ln.w"), w("out_ln.b"), eps_.at("out_ln"));
       }
     }
     tm_[5] = (float)mla;
@@ -547,9 +518,9 @@ class Model {
   std::vector<uint16_t> pos_;
   std::vector<int> order_;
   std::vector<std::string> vit_;
-  std::unique_ptr<Buffer> patches_, va_, vb_, sp_, f4_, f2_, f1_, tin_, text_, tmask_, enc_, visk_, qpos_, rpb_, e2_,
+  std::unique_ptr<Buffer> patches_, va_, vb_, sp_, f4_, f2_, f1_, tin_, text_, tmask_, enc_, visk_, h0_, qsine_, dy_, dx_, e2_,
       inst_;
-  std::unique_ptr<Buffer> h_[2];
+  std::unique_ptr<Buffer> dout_[2];
   Buffer* vit_out_ = nullptr;
   std::map<std::string, std::unique_ptr<Stage>> stages_;
 };

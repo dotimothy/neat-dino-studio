@@ -19,7 +19,9 @@ for n in "${ordered[@]}"; do
   if [[ -f "$out/compile_summary.json" ]] && grep -q '"single_mla_elf": true' "$out/compile_summary.json"; then continue; fi
   while [[ $(jobs -rp | wc -l) -ge $JOBS ]]; do wait -n; done
   rm -rf "$out"
-  compile/compile.sh --model "build/probes/$n.onnx" --precision bf16 --name "$n" --out "$out" > /dev/null 2>&1 &
+  calib=()
+  [[ -f "build/calib/$n.npz" ]] && calib=(--calib "build/calib/$n.npz")     # bf16 LUT ranges need real data
+  compile/compile.sh --model "build/probes/$n.onnx" --precision bf16 --name "$n" --out "$out" "${calib[@]}" > /dev/null 2>&1 &
 done
 wait
 printf '%-22s %-5s %-4s %-6s %s\n' stage elfs a65 secs elf_mb

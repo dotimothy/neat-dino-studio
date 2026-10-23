@@ -459,3 +459,71 @@ class Pipeline(nn.Module):
                 me = F.relu(me)
         masks = torch.einsum("qc,chw->qhw", rows(me), inst[0])
         return {"logits": logits, "boxes": boxes, "presence": pres, "masks": masks}
+
+
+# --------------------------------------------------------------------------- decoder layer with its heads on the MLA
+BIAS_IN = 16   # the box bias inputs carry 2 values padded to 16 channels: a 2-channel MLA input miscompiles
+
+
+def box_log_deltas(ref_cxcywh, G):
+    """The box bias MLPs' inputs: log-scaled distances from each grid coordinate to the box's two
+    edges, per axis. Returns dy, dx as (1, BIAS_IN, G, Q) (C = edge then zeros, H = coordinate, W = query)."""
+    b = torch.cat([ref_cxcywh[:, :2] - ref_cxcywh[:, 2:] / 2, ref_cxcywh[:, :2] + ref_cxcywh[:, 2:] / 2], 1)
+    c = torch.arange(G, dtype=torch.float32) / G
+    lg = lambda d: torch.sign(d * 8) * torch.log2((d * 8).abs() + 1.0) / math.log2(8)   # noqa: E731
+    dy = lg(c.view(1, -1, 1) - b[:, None, 1::2])                  # (Q, G, 2)
+    dx = lg(c.view(1, -1, 1) - b[:, None, 0::2])
+    pad = lambda t: torch.cat([t.permute(2, 1, 0)[None], torch.zeros(1, BIAS_IN - 2, G, t.shape[0])], 1)  # noqa: E731
+    return pad(dy).contiguous(), pad(dx).contiguous()
+
+
+class DecFull(nn.Module):
+    """One decoder layer plus everything around it that used to run on the CPU: the query position
+    (MLP of the boxes' sine embedding), the box relative-position bias (two MLPs over the
+    log-scaled edge distances, expanded to (keys, heads, queries) by fixed 0/1 1x1 convs) and the
+    box head on the output-normed queries. Output: [h' (1 + Q tokens) | box delta (Q tokens,
+    channels 0-3)] as (1, 256, 1, 1 + 2Q)."""
+
+    def __init__(self, layer: DecLayer, hf, G):
+        super().__init__()
+        d = hf.detr_decoder
+        self.l, self.G = layer, G
+        self.ref_head = DecMLP(d.ref_point_head)
+        self.rpb_y, self.rpb_x = DecMLP(d.box_rpb_embed_y), DecMLP(d.box_rpb_embed_x)
+        for m in (self.rpb_y, self.rpb_x):                       # first conv: 2 -> BIAS_IN inputs, zero weights
+            c0 = m.l[0]
+            c = nn.Conv2d(BIAS_IN, c0.out_channels, 1)
+            c.weight.data.zero_()
+            c.weight.data[:, :2] = c0.weight.data
+            c.bias.data.copy_(c0.bias.data)
+            m.l[0] = c
+        self.out_ln = LN(d.output_layer_norm)
+        bh = DecMLP(d.box_head)
+        last = bh.l[-1]                                           # 256 -> 4, padded to 256 outputs
+        pad = nn.Conv2d(last.in_channels, 256, 1)
+        pad.weight.data.zero_()
+        pad.bias.data.zero_()
+        pad.weight.data[:4] = last.weight.data
+        pad.bias.data[:4] = last.bias.data
+        bh.l[-1] = pad
+        self.box_head = bh
+        N = G * G
+        ey = torch.zeros(N, G)                                    # key (y, x) <- row y / column x
+        ex = torch.zeros(N, G)
+        for k in range(N):
+            ey[k, k // G] = 1.0
+            ex[k, k % G] = 1.0
+        self.ey, self.ex = nn.Conv2d(G, N, 1, bias=False), nn.Conv2d(G, N, 1, bias=False)
+        self.ey.weight.data.copy_(ey[:, :, None, None])
+        self.ex.weight.data.copy_(ex[:, :, None, None])
+
+    def forward(self, h, qsine, text, tmask, enc, vis_k, dy, dx):
+        qpos = self.ref_head(qsine)                               # (1, 256, 1, Q)
+        qpos = torch.cat([qpos[:, :, :, :1] - qpos[:, :, :, :1], qpos], 3)      # presence token: 0
+        by = self.rpb_y(dy).permute(0, 2, 1, 3)                   # (1, 8, G, Q) -> (1, G, 8, Q)
+        bx = self.rpb_x(dx).permute(0, 2, 1, 3)
+        rpb = self.ey(by) + self.ex(bx)                           # (1, G*G, 8, Q)
+        rpb = torch.cat([rpb[:, :, :, :1] - rpb[:, :, :, :1], rpb], 3)
+        h2 = self.l(h, qpos, text, tmask, enc, vis_k, rpb)
+        delta = self.box_head(self.out_ln(h2[:, :, :, 1:]))       # (1, 256, 1, Q), deltas in channels 0-3
+        return torch.cat([h2, delta], 3)

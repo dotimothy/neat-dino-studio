@@ -1245,7 +1245,7 @@ function modelRow(m) {
     btn(m.partial_bytes ? "Resume" : "Download", "download", () => modelAction("download", m.name), "primary");
     if (m.partial_bytes) btn("Discard", "trash", () => modelAction("discard", m.name));
   } else if (m.state === "on_board") {
-    if (m.kind === "detector") {
+    if (m.kind === "detector" || m.kind === "sam3") {
       if (m.loaded) btn("Unload", "stop", () => modelAction("unload", m.name));
       else btn("Load", "chip", () => modelAction("load", m.name), "primary");
     }

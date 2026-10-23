@@ -14,7 +14,7 @@ for a in "$@"; do
 done
 ssh "$BOARD" "mkdir -p '$REMOTE'"
 rsync -a --delete \
-  --exclude .git --exclude .venv --exclude build --exclude data/coco --exclude 'data/images/*.jpg' \
+  --exclude .git --exclude .venv --exclude .venv-sam3 --exclude .claude --exclude build --exclude data/coco --exclude 'data/images/*.jpg' \
   --exclude runtime/build --exclude webapp/certs --exclude webapp/server.log --exclude __pycache__ \
   --exclude .models-dir --exclude docs/assets \
   "$ROOT/" "$BOARD:$REMOTE/"

@@ -128,6 +128,9 @@ def main():
     ap.add_argument("--mla-tess", choices=["ev74", "hwc", "hwc16"], default="hwc",
                     help="where (de)tessellation runs: ev74 plugins, or on the MLA with this DRAM "
                          "layout (default; EV74 tessellation of wide token tensors takes seconds)")
+    ap.add_argument("--auto-layout", action="store_true", help="quantize with automatic_layout_conversion (LLiMa does)")
+    ap.add_argument("--compress", action="store_true", help="compile with compress=True (LLiMa does)")
+    ap.add_argument("--layout-effort", type=int, default=None, help="layout_search_effort_level (LLiMa: 0, or 1)")
     ap.add_argument("--io-dtype", choices=["fp32", "bf16"], default="fp32",
                     help="graph input type: bf16 lets the host hand the MLA bf16 data directly")
     args = ap.parse_args()
@@ -161,7 +164,8 @@ def main():
             {node: {"quantization_precision": table[p]} for node, p in over.items()})
         log(f"  {len(over)} per-node precision overrides from {args.quant_overrides}")
     calib = calibration_set(args.calib, inputs, args.num_calib, args.precision)
-    q = net.quantize(calibration_data=calib, quantization_config=cfg, model_name=name, log_level=logging.INFO)
+    qkw = {"automatic_layout_conversion": True} if args.auto_layout else {}
+    q = net.quantize(calibration_data=calib, quantization_config=cfg, model_name=name, log_level=logging.INFO, **qkw)
     q.save(model_name=name, output_directory=out)
     log(f"  quantized model saved to {out} ({time.time() - t0:.0f} s)")
 
@@ -179,6 +183,12 @@ def main():
                                             persistent_mem_name=None, dram_shape=None)
             kw["tessellate_parameters"] = get_tessellate_parameters(q, {0: tp}, {0: tp})
             log(f"  tessellation on the MLA, DRAM layout {lay}")
+        if args.compress:
+            kw["compress"] = True
+        if args.layout_effort is not None:
+            kw["layout_search_effort_level"] = args.layout_effort
+        if kw:
+            log(f"  compile options: { {k: v for k, v in kw.items() if k != 'tessellate_parameters'} }")
         q.compile(output_path=out, batch_size=1, log_level=logging.DEBUG if os.environ.get("DINO_COMPILE_DEBUG") else logging.INFO, **kw)
         log(f"  compiled ({time.time() - t0:.0f} s total)")
         s = summarize_mpk(out) or {}

@@ -438,8 +438,8 @@ class Studio:
     def catalog(self) -> dict:
         local = local_bundles(self.models_dir)
         hub = self.hub.models()
-        names = sorted(set(local) | set(hub), key=lambda n: (0 if (local.get(n) or hub.get(n, {})).get("kind") ==
-                                                              "detector" else 1, n))
+        names = sorted(set(local) | set(hub), key=lambda n: (0 if (local.get(n) or hub.get(n, {})).get("kind") in
+                                                              ("detector", "sam3") else 1, n))
         job = self.hub.job()
         out = []
         for n in names:
