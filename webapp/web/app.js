@@ -675,7 +675,7 @@ function stopLive(why) {
 }
 
 // --------------------------------------------------------------------- voice
-const V = { rec: null, stream: null, chunks: [], t0: 0, held: 0, timer: null, ctx: null, key: "" };
+const V = { rec: null, t0: 0, held: 0, timer: null, key: "", wav: null };
 const MAX_REC_S = 15;
 const NO_SPEECH_S = 5;          // a click that never hears speech gives up after this long
 
@@ -710,56 +710,130 @@ function micUp() {
   if (V.rec && performance.now() - V.held > 400) stopRec();
 }
 
+// ---- microphone: opened ahead of time and kept warm, with a pre-roll so the first words count
+// Opening a microphone takes a moment; if that happens on the Speak click, the start of the
+// sentence is lost (and was measured as "room noise"). So the mic opens when the pointer comes
+// near Speak (once permission was given), stays open for a minute after use, and always keeps
+// the last 1.5 s: a recording starts with that pre-roll, whose level is the room's noise floor.
+const MIC = { stream: null, ctx: null, src: null, node: null, rate: 48000, ring: [], ringS: 0, rec: null,
+  rms: 0, closeT: 0, opening: null };
+const PREROLL_S = 1.5, WARM_S = 60;
+
+function chunkRms(a) {
+  let s = 0;
+  for (let i = 0; i < a.length; i++) s += a[i] * a[i];
+  return Math.sqrt(s / a.length);
+}
+
+function onPcm(buf) {
+  const a = new Float32Array(buf);                 // copy: the browser reuses its buffer
+  const r = chunkRms(a);
+  MIC.rms = r;
+  if (MIC.rec) {
+    MIC.rec.chunks.push(a);
+  } else {
+    MIC.ring.push({ a, r });
+    MIC.ringS += a.length / MIC.rate;
+    while (MIC.ring.length > 1 && MIC.ringS - MIC.ring[0].a.length / MIC.rate >= PREROLL_S) MIC.ringS -= MIC.ring.shift().a.length / MIC.rate;
+  }
+}
+
+async function micWarm() {
+  clearTimeout(MIC.closeT);
+  MIC.closeT = setTimeout(micClose, WARM_S * 1000);
+  if (MIC.stream) return;
+  if (MIC.opening) return MIC.opening;
+  MIC.opening = (async () => {
+    const stream = await getMicStream();
+    const ctx = new AudioContext();
+    await ctx.resume().catch(() => {});
+    const src = ctx.createMediaStreamSource(stream);
+    const node = ctx.createScriptProcessor(2048, 1, 1);
+    node.onaudioprocess = (e) => onPcm(e.inputBuffer.getChannelData(0));
+    src.connect(node);
+    node.connect(ctx.destination);                 // needed for it to run; its output is silence
+    Object.assign(MIC, { stream, ctx, src, node, rate: ctx.sampleRate, ring: [], ringS: 0 });
+  })().finally(() => { MIC.opening = null; });
+  return MIC.opening;
+}
+
+function micClose() {
+  if (MIC.rec) {                                   // still recording: check again later
+    MIC.closeT = setTimeout(micClose, WARM_S * 1000);
+    return;
+  }
+  if (MIC.node) MIC.node.disconnect();
+  if (MIC.stream) MIC.stream.getTracks().forEach((t) => t.stop());
+  if (MIC.ctx) MIC.ctx.close().catch(() => {});
+  Object.assign(MIC, { stream: null, ctx: null, src: null, node: null, ring: [], ringS: 0 });
+}
+
+// Warm up on hover/focus only when the mic is already allowed (never trigger a permission prompt on hover).
+async function micWarmIfAllowed() {
+  const vs = S.status && S.status.voice;
+  if (!vs || vs.state !== "ready" || MIC.stream || !navigator.permissions) return;
+  try {
+    const p = await navigator.permissions.query({ name: "microphone" });
+    if (p.state === "granted") micWarm().catch(() => {});
+  } catch (e) { /* permissions API without "microphone" */ }
+}
+
+function toWav(chunks, rate, out = 16000) {
+  let n = 0;
+  for (const c of chunks) n += c.length;
+  const pcm = new Float32Array(n);
+  let o = 0;
+  for (const c of chunks) { pcm.set(c, o); o += c.length; }
+  const m = Math.floor(n * out / rate), step = rate / out;
+  const buf = new ArrayBuffer(44 + m * 2), v = new DataView(buf);
+  const str = (off, s) => { for (let i = 0; i < s.length; i++) v.setUint8(off + i, s.charCodeAt(i)); };
+  str(0, "RIFF"); v.setUint32(4, 36 + m * 2, true); str(8, "WAVE"); str(12, "fmt ");
+  v.setUint32(16, 16, true); v.setUint16(20, 1, true); v.setUint16(22, 1, true); v.setUint32(24, out, true);
+  v.setUint32(28, out * 2, true); v.setUint16(32, 2, true); v.setUint16(34, 16, true); str(36, "data"); v.setUint32(40, m * 2, true);
+  for (let i = 0; i < m; i++) {                    // linear resampling to 16 kHz
+    const x = i * step, j = Math.floor(x), f = x - j;
+    const s = (pcm[j] || 0) * (1 - f) + (pcm[j + 1] || 0) * f;
+    v.setInt16(44 + i * 2, Math.max(-1, Math.min(1, s)) * 0x7fff, true);
+  }
+  return new Blob([buf], { type: "audio/wav" });
+}
+
 async function startRec() {
-  if (!navigator.mediaDevices || !window.MediaRecorder)
+  if (!navigator.mediaDevices || !window.AudioContext)
     return toast("This browser can't record here. Open the studio over HTTPS.", true);
   try {
-    V.stream = await getMicStream();
+    await micWarm();
   } catch (e) {
     return toast("Microphone not available: " + e.message, true);
   }
-  const mime = ["audio/webm;codecs=opus", "audio/ogg;codecs=opus", "audio/webm", "audio/mp4"].find((m) => MediaRecorder.isTypeSupported(m)) || "";
-  V.rec = new MediaRecorder(V.stream, mime ? { mimeType: mime } : {});
-  V.chunks = [];
-  V.rec.ondataavailable = (e) => { if (e.data.size) V.chunks.push(e.data); };
-  V.rec.onstop = sendRec;
-  V.rec.start();
+  // the pre-roll goes first; its level is the room's noise floor
+  const pre = MIC.ring.splice(0);
+  MIC.ringS = 0;
+  const preR = pre.map((c) => c.r).sort((x, y) => x - y);
+  MIC.rec = { chunks: pre.map((c) => c.a) };
+  V.rec = true;
   V.t0 = performance.now();
   $("#mic-btn").classList.add("rec");
   $("#mic-btn .mic-t").textContent = "Stop";
   voiceLine(`<span class="lvl"><span></span></span><span><span class="what">Listening…</span> <b class="secs">0.0</b> s</span>`);
-  let rms = null;
-  try {
-    V.ctx = new AudioContext();
-    const an = V.ctx.createAnalyser();
-    an.fftSize = 1024;
-    V.ctx.createMediaStreamSource(V.stream).connect(an);
-    const buf = new Float32Array(an.fftSize);
-    rms = () => {
-      an.getFloatTimeDomainData(buf);
-      let s = 0;
-      for (const v of buf) s += v * v;
-      return Math.sqrt(s / buf.length);
-    };
-  } catch (e) { /* no level meter and no auto-stop */ }
-  // End of speech: learn the room's noise for the first moments, call it speech when the level is
-  // well above that, and stop after a pause once something was said (not while the button is held).
+  // End of speech: call it speech when the level is well above the floor, and stop after a
+  // pause once something was said (not while the button or the space bar is held).
   const autostop = $("#voice-autostop").checked, pause = +$("#voice-pause").value;
-  const vad = { floor: null, voiced: 0, spoke: false, quietSince: null };
+  const vad = { floor: preR.length >= 4 ? preR[Math.floor(preR.length * 0.2)] : null, voiced: 0, spoke: false, quietSince: null };
   V.noSpeech = false;
   V.timer = setInterval(() => {
     const now = performance.now(), t = (now - V.t0) / 1000;
     const sec = $("#voice-line .secs"), bar = $("#voice-line .lvl span"), what = $("#voice-line .what");
     if (sec) sec.textContent = t.toFixed(1);
-    const r = rms ? rms() : 0;
-    if (bar && rms) bar.style.width = `${Math.round(Math.min(1, r * 8) * 100)}%`;
+    const r = MIC.rms;
+    if (bar) bar.style.width = `${Math.round(Math.min(1, r * 8) * 100)}%`;
     if (t >= MAX_REC_S) return stopRec();
-    if (!rms || !autostop) return;
-    if (t < 0.25) {                                   // noise floor from the start of the recording
-      vad.floor = vad.floor == null ? r : Math.min(vad.floor, r);
-      return;
+    if (!autostop) return;
+    if (vad.floor == null) {                       // mic just opened, no pre-roll yet
+      if (t < 0.25) return;
+      vad.floor = r;
     }
-    const on = Math.min(0.06, Math.max(0.012, (vad.floor || 0) * 3));  // speech threshold
+    const on = Math.min(0.05, Math.max(0.012, vad.floor * 3));
     if (r > on) {
       vad.voiced += 80;
       vad.quietSince = null;
@@ -767,9 +841,8 @@ async function startRec() {
         vad.spoke = true;
         if (what) what.textContent = "Hearing you…";
       }
-    } else {
-      if (vad.quietSince == null) vad.quietSince = now;
-      if (!vad.spoke) vad.floor = vad.floor * 0.95 + r * 0.05;   // keep learning until speech starts
+    } else if (vad.quietSince == null) {
+      vad.quietSince = now;
     }
     if (V.holding) return;
     if (vad.spoke && vad.quietSince != null && (now - vad.quietSince) / 1000 >= pause) stopRec();
@@ -784,22 +857,22 @@ function stopRec() {
   if (!V.rec) return;
   clearInterval(V.timer);
   V.dur = (performance.now() - V.t0) / 1000;
-  try { V.rec.stop(); } catch (e) { /* already stopped */ }
-  V.stream.getTracks().forEach((t) => t.stop());
-  if (V.ctx) V.ctx.close().catch(() => {});
-  V.rec = V.stream = V.ctx = null;
+  const rec = MIC.rec;
+  MIC.rec = null;
+  V.rec = null;
+  micWarm().catch(() => {});                       // keep the mic warm for the next request
   $("#mic-btn").classList.remove("rec");
   $("#mic-btn .mic-t").textContent = "Speak";
+  V.wav = rec ? toWav(rec.chunks, MIC.rate) : null;
+  sendRec();
 }
 
 async function sendRec() {
   if (V.noSpeech) return voiceLine("Didn’t hear anything. Click Speak and say what to find.", "err");
   if (V.dur < 0.4) return voiceLine("Too short. Hold Speak while you talk, or click once to start and again to stop.", "err");
-  const type = (V.chunks[0] && V.chunks[0].type) || "audio/webm";
-  const blob = new Blob(V.chunks, { type });
-  const ext = type.includes("ogg") ? "ogg" : type.includes("mp4") ? "m4a" : "webm";
+  if (!V.wav) return;
   const fd = new FormData();
-  fd.append("audio", blob, `speech.${ext}`);
+  fd.append("audio", V.wav, "speech.wav");
   V.busy = true;
   $("#mic-btn").classList.add("wait");
   voiceLine(`<span class="spinner"></span><span>Transcribing…</span>`);
@@ -1214,6 +1287,7 @@ function init() {
   };
   $("#mic-select").onchange = (e) => {
     store.set("mic-device", e.target.value);
+    micClose();                                     // the warm mic reopens on the new device
     renderDevices();
   };
   if (navigator.mediaDevices && navigator.mediaDevices.addEventListener)
@@ -1274,6 +1348,8 @@ function init() {
   });
   $("#detect-btn").onclick = () => detect();
   const mic = $("#mic-btn");
+  mic.addEventListener("pointerenter", micWarmIfAllowed);
+  mic.addEventListener("focus", micWarmIfAllowed);
   mic.addEventListener("pointerdown", micDown);
   mic.addEventListener("pointerup", micUp);
   mic.addEventListener("pointerleave", micUp);

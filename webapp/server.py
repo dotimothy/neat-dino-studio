@@ -539,7 +539,9 @@ class Studio:
         except VoiceError as e:
             raise StudioError(str(e)) from e
         if not tr["text"] or (tr["no_speech"] > 0.6 and len(tr["text"]) < 4):
-            raise StudioError("Didn’t catch that. Hold the mic button and say what to find.")
+            log(f"voice: no speech in {len(audio)} bytes of {mime} (transcript {tr['text']!r}, "
+                f"no_speech {tr['no_speech']:.2f})")
+            raise StudioError("Didn’t catch that. Click Speak and say what to find.")
         pr = self.voice.to_prompt(tr["text"])
         return {"transcript": tr["text"], "prompt": pr["prompt"], "by": pr["by"],
                 "timing": {"asr": tr["ms"], "llm": pr["ms"]}, "llm": self.voice.llm}
