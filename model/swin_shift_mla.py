@@ -11,23 +11,32 @@ from __future__ import annotations
 
 import torch
 
-WS, H = 12, 6
+WS, H = 12, 6            # Swin-B (grounding-dino-base); Swin-T uses ws 7, shift 3
+
+
+def _region(x, r0, r1, c0, c1, ws):
+    """Rows r0..r1-1, columns c0..c1-1 of every window: (1, C, nW, (r1-r0)*(c1-c0)), row-major."""
+    return torch.cat([x[:, :, :, r * ws + c0: r * ws + c1] for r in range(r0, r1)], 3)
+
+
+def _assemble2(tl, tr, bl, br, h1, w1, h2, w2):
+    """Four blocks (top h1 rows: tl is w1 wide, tr w2; bottom h2 rows: bl, br) -> windows."""
+    rows = []
+    for i in range(h1):
+        rows += [tl[:, :, :, i * w1:(i + 1) * w1], tr[:, :, :, i * w2:(i + 1) * w2]]
+    for i in range(h2):
+        rows += [bl[:, :, :, i * w1:(i + 1) * w1], br[:, :, :, i * w2:(i + 1) * w2]]
+    return torch.cat(rows, 3)
 
 
 def _quad(x, qi, qj):
-    """Quadrant (qi, qj in {0, 1}) of every window: (1, C, nW, 36), row-major."""
-    rows = [x[:, :, :, (qi * H + i) * WS + qj * H: (qi * H + i) * WS + qj * H + H] for i in range(H)]
-    return torch.cat(rows, 3)
+    """Quadrant (qi, qj in {0, 1}) of every 12x12 window: (1, C, nW, 36), row-major."""
+    return _region(x, qi * H, qi * H + H, qj * H, qj * H + H, WS)
 
 
 def _assemble(tl, tr, bl, br):
     """Four (1, C, nW, 36) quadrants -> (1, C, nW, 144) windows."""
-    rows = []
-    for i in range(H):
-        rows += [tl[:, :, :, i * H:(i + 1) * H], tr[:, :, :, i * H:(i + 1) * H]]
-    for i in range(H):
-        rows += [bl[:, :, :, i * H:(i + 1) * H], br[:, :, :, i * H:(i + 1) * H]]
-    return torch.cat(rows, 3)
+    return _assemble2(tl, tr, bl, br, H, H, H, H)
 
 
 def _shift_windows(q, nh, nw, da, db):
@@ -45,16 +54,26 @@ def _shift_windows(q, nh, nw, da, db):
     return q
 
 
-def plain_to_shifted(x, nh, nw):
-    br, bl, tr, tl = _quad(x, 1, 1), _quad(x, 1, 0), _quad(x, 0, 1), _quad(x, 0, 0)
-    return _assemble(br, _shift_windows(bl, nh, nw, 0, 1), _shift_windows(tr, nh, nw, 1, 0),
-                     _shift_windows(tl, nh, nw, 1, 1))
+def plain_to_shifted(x, nh, nw, ws=WS, shift=H):
+    """Rolled by -shift, a shifted window (a, b) takes the last ws-shift rows/columns of plain
+    window (a, b) and the first shift rows/columns of its neighbours (a+1, b), (a, b+1), (a+1, b+1)."""
+    k = ws - shift
+    tl = _region(x, shift, ws, shift, ws, ws)                                    # k x k
+    tr = _shift_windows(_region(x, shift, ws, 0, shift, ws), nh, nw, 0, 1)       # k x shift
+    bl = _shift_windows(_region(x, 0, shift, shift, ws, ws), nh, nw, 1, 0)       # shift x k
+    br = _shift_windows(_region(x, 0, shift, 0, shift, ws), nh, nw, 1, 1)        # shift x shift
+    return _assemble2(tl, tr, bl, br, k, k, shift, shift)
 
 
-def shifted_to_plain(y, nh, nw):
-    tl, tr, bl, br = _quad(y, 0, 0), _quad(y, 0, 1), _quad(y, 1, 0), _quad(y, 1, 1)
-    return _assemble(_shift_windows(br, nh, nw, -1, -1), _shift_windows(bl, nh, nw, -1, 0),
-                     _shift_windows(tr, nh, nw, 0, -1), tl)
+def shifted_to_plain(y, nh, nw, ws=WS, shift=H):
+    """The reverse: a plain window's first shift rows/columns come from the shifted windows
+    before it, the rest from shifted window (a, b)."""
+    k = ws - shift
+    tl = _shift_windows(_region(y, k, ws, k, ws, ws), nh, nw, -1, -1)            # shift x shift
+    tr = _shift_windows(_region(y, k, ws, 0, k, ws), nh, nw, -1, 0)              # shift x k
+    bl = _shift_windows(_region(y, 0, k, k, ws, ws), nh, nw, 0, -1)              # k x shift
+    br = _region(y, 0, k, 0, k, ws)                                              # k x k
+    return _assemble2(tl, tr, bl, br, shift, shift, k, k)
 
 
 def _zeros_like_windows(q, n):

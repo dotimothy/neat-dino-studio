@@ -31,3 +31,23 @@ def test_plan_tables():
             t = st.table[st.table >= 0]
             assert len(set(t.tolist())) == len(t), st.name
     assert sum(s.op == "run" for s in steps) == 27
+
+
+@pytest.mark.parametrize("ws,shift,Hp", [(12, 6, 24), (12, 6, 36), (7, 3, 21), (7, 3, 147), (7, 3, 14)])
+def test_shift_by_slices_matches_roll(ws, shift, Hp):
+    """Swin-B (12/6) and Swin-T (7/3) window shifts with Slice/Concat equal roll + partition."""
+    import torch
+    import dino_mla as M
+    import swin_shift_mla as SS
+    n = Hp // ws
+    x = torch.randn(1, 3, Hp, Hp)
+    plain = M.window_partition(x, ws)
+    shifted = SS.plain_to_shifted(plain, n, n, ws, shift)
+    assert torch.equal(shifted, M.window_partition(M.roll_hw(x, -shift), ws))
+    assert torch.equal(SS.shifted_to_plain(shifted, n, n, ws, shift), plain)
+
+
+@pytest.mark.parametrize("ws,shift,Hp", [(7, 3, 147), (7, 3, 21)])
+def test_tiny_layouts_are_permutations(ws, shift, Hp):
+    for sh in (0, 1):
+        assert sorted(BP.layout(Hp, Hp, sh, ws, shift)) == list(range(Hp * Hp))

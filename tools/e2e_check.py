@@ -23,10 +23,9 @@ def prepare(a):
     sys.path.insert(0, str(ROOT / "model"))
     import dino_mla as M
     from PIL import Image
-    from transformers import AutoModelForZeroShotObjectDetection
     from dino import prompt as P
     from dino.letterbox import letterbox
-    hf = AutoModelForZeroShotObjectDetection.from_pretrained("IDEA-Research/grounding-dino-base").eval()
+    hf = M.load_hf(a.model)
     pipe = M.Pipeline(hf, a.size)
     pr = P.build(a.prompt, P.Tokenizer())
     img = Image.open(a.image).convert("RGB")
@@ -94,6 +93,7 @@ def main():
     sub = ap.add_subparsers(dest="cmd", required=True)
     p = sub.add_parser("prepare"); p.add_argument("--size", type=int, default=576); p.add_argument("--image")
     p.add_argument("--prompt"); p.add_argument("--out")
+    p.add_argument("--model", default="base", choices=["base", "tiny"])
     r = sub.add_parser("run"); r.add_argument("--case"); r.add_argument("--bundle"); r.add_argument("--text-bundle")
     r.add_argument("--rt"); r.add_argument("--tokens", action="store_true"); r.add_argument("--iters", type=int, default=3)
     c = sub.add_parser("compare"); c.add_argument("--case"); c.add_argument("--board"); c.add_argument("--top", type=int, default=10)

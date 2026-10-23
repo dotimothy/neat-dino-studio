@@ -39,8 +39,12 @@ ALLOWED = {"Conv", "Add", "Sub", "Mul", "Div", "Relu", "Erf", "Softmax", "Einsum
            "Exp", "Reciprocal"}
 
 
-def stage_name(S, st):
-    return "text_t64" if st == "text" else f"s{S}_{st}"
+PREFIX = {"base": ("s", "text_t64"), "tiny": ("t", "tiny_text_t64")}   # build names per model
+
+
+def stage_name(S, st, model="base"):
+    p, text = PREFIX[model]
+    return text if st == "text" else f"{p}{S}_{st}"
 
 
 def constants_to_initializers(model):
@@ -92,7 +96,7 @@ def export(name, module, x, ref_out, simplify=True):
           + (f"  UNEXPECTED OPS {bad}" if bad else ""))
 
 
-def export_backbone(hf, S, image, only=None, fused=False, skip_existing=False):
+def export_backbone(hf, S, image, only=None, fused=False, skip_existing=False, model="base"):
     """Export every MLA program of the window-layout backbone (model/backbone_plan.py,
     or the fused 9-program version in model/backbone_fused.py)."""
     import backbone_plan as BP
@@ -121,11 +125,11 @@ def export_backbone(hf, S, image, only=None, fused=False, skip_existing=False):
     BP.run_torch(steps, M.space_to_depth4(px), M.geometry(hf, S).N)
     for st, m in bufs_steps:
         st.module = m
-        if (only and st.name not in only) or (skip_existing and (OUT / f"s{S}_{st.name}.onnx").exists()
+        if (only and st.name not in only) or (skip_existing and (OUT / f"{stage_name(S, st.name, model)}.onnx").exists()
                                                and st.name in ("bb_stage1", "bb_stage3b", "bb_stage3c")):
             continue
         x, y = rec[st.name]
-        export(f"s{S}_{st.name}", m, x, y)
+        export(stage_name(S, st.name, model), m, x, y)
     return steps
 
 
@@ -138,17 +142,17 @@ def main():
     ap.add_argument("--backbone-fused", action="store_true", help="export the fused 9-program backbone")
     ap.add_argument("--image", default=str(ROOT / "data/images/cats.jpg"))
     ap.add_argument("--prompt", default="a cat. a remote control. a couch. a blanket.")
+    ap.add_argument("--model", default="base", choices=sorted(M.MODELS), help="grounding-dino-base or -tiny")
     a = ap.parse_args()
     stages = [s for s in (ALL if a.all else a.stages) if s != "backbone"]
     from PIL import Image
-    from transformers import AutoModelForZeroShotObjectDetection
-    hf = AutoModelForZeroShotObjectDetection.from_pretrained("IDEA-Research/grounding-dino-base").eval()
+    hf = M.load_hf(a.model)
     if a.backbone_fused:
-        export_backbone(hf, a.size, a.image, fused=True)
+        export_backbone(hf, a.size, a.image, fused=True, model=a.model)
         if not stages:
             return
     if a.backbone_plan or a.all:
-        export_backbone(hf, a.size, a.image)
+        export_backbone(hf, a.size, a.image, model=a.model)
         if not stages:
             return
     rec = {}
@@ -165,7 +169,7 @@ def main():
         pipe(M.space_to_depth4(px), pr)
     for st in stages:
         mod, x, y = rec[st]
-        export(stage_name(a.size, st), mod, x, y)
+        export(stage_name(a.size, st, a.model), mod, x, y)
 
 
 if __name__ == "__main__":

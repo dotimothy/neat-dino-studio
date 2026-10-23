@@ -2,6 +2,7 @@
 # Compile every Grounding DINO stage of one input size to its own MLA ELF (bf16, plain HWC I/O).
 #   compile/build_stages.sh 576 [stage ...]      (default: all stages + text)
 #   PREC=w8a16 JOBS=6 compile/build_stages.sh 768
+#   MODEL=tiny compile/build_stages.sh 576       (grounding-dino-tiny: t576_* stages + tiny_text_t64)
 # Reads build/probes/<name>.onnx from model/export_onnx.py; writes build/stages/<prec>/<name>/.
 set -uo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd -P)"
@@ -9,21 +10,24 @@ cd "$ROOT"
 S="$1"; shift
 PREC="${PREC:-bf16}"
 JOBS="${JOBS:-6}"
+MODEL="${MODEL:-base}"
+if [[ "$MODEL" == tiny ]]; then P=t; TEXT=tiny_text_t64; else P=s; TEXT=text_t64; fi
 stages=("$@")
 if [[ ${#stages[@]} -eq 0 ]]; then
   # every exported stage of this size (model/export_onnx.py --all), plus the shared text encoder
-  stages=(text_t64)
-  for f in build/probes/s${S}_*.onnx; do
-    n="$(basename "$f" .onnx)"; n="${n#s${S}_}"
+  stages=("$TEXT")
+  for f in build/probes/${P}${S}_*.onnx; do
+    n="$(basename "$f" .onnx)"; n="${n#${P}${S}_}"
     [[ "$n" == backbone ]] || stages+=("$n")
   done
 fi
 names=()
-for st in "${stages[@]}"; do [[ "$st" == text_t64 ]] && names+=(text_t64) || names+=("s${S}_$st"); done
+for st in "${stages[@]}"; do [[ "$st" == "$TEXT" || "$st" == text_t64 ]] && names+=("$TEXT") || names+=("${P}${S}_$st"); done
 # The biggest graphs first, so the long compiles start early.
 ordered=()
-for n in "${names[@]}"; do [[ "$n" == *_bb_s4* || "$n" == *_bb_s1* || "$n" == text_t64 ]] && ordered+=("$n"); done
-for n in "${names[@]}"; do [[ "$n" == *_bb_s4* || "$n" == *_bb_s1* || "$n" == text_t64 ]] || ordered+=("$n"); done
+big() { [[ "$1" == *_bb_s4* || "$1" == *_bb_s1* || "$1" == *_bb_stage1 || "$1" == *_bbm_stage* || "$1" == "$TEXT" ]]; }
+for n in "${names[@]}"; do big "$n" && ordered+=("$n"); done
+for n in "${names[@]}"; do big "$n" || ordered+=("$n"); done
 for n in "${ordered[@]}"; do
   out="build/stages/$PREC/$n"
   if [[ -f "$out/compile_summary.json" ]] && grep -q '"single_mla_elf": true' "$out/compile_summary.json"; then

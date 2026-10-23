@@ -166,6 +166,8 @@ function showBanner(text, err = false, action = null) {
 
 function prettyModel(n) {
   if (!n) return "No Model";
+  const t = /dino-tiny-(\d+)-(\w+)/.exec(n);
+  if (t) return `Grounding DINO Tiny · ${t[1]} px · ${t[2]}`;
   const m = /dino-(\d+)-(\w+)/.exec(n);
   if (!m) return n;
   return `Grounding DINO Base · ${m[1] === "768" ? "Accurate" : m[1] === "576" ? "Fast" : ""} ${m[1]} px · ${m[2]}`;

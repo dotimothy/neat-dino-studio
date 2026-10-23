@@ -3,6 +3,7 @@
 
     .venv/bin/python tools/make_bundle.py --size 576 [--prec bf16]
     .venv/bin/python tools/make_bundle.py --text
+    .venv/bin/python tools/make_bundle.py --model tiny --text --size 576      # grounding-dino-tiny
 
 Detector bundle  build/bundles/dino-<size>-<prec>/
     manifest.json        size, tokens, levels, stages, precision, sha256 of every file
@@ -13,6 +14,8 @@ Detector bundle  build/bundles/dino-<size>-<prec>/
     valid.u8             proposal validity (N)
     invalid_query.f32    object query of an invalid token, LN(enc_output(0)) (256)
     query_embed.bf16     decoder query embeddings (900 x 256)
+
+Tiny: build/bundles/dino-tiny-<size>-<prec>/ and dino-tiny-text-t64-<prec>/ (its BERT has its own weights).
 
 Text bundle  build/bundles/dino-text-t64-<prec>/
     text_t64.elf, tokenizer.json, vocab.txt, embeddings.npz (word / position / type, fp16), manifest.json
@@ -36,6 +39,8 @@ sys.path.insert(0, str(ROOT / "model"))
 STAGES = [f"enc{k}" for k in range(7)] + ["dec_values"] + \
          [f"dec_pre{k}" for k in range(6)] + [f"dec_post{k}" for k in range(6)]
 FORMAT = 1
+# per model: (stage-name prefix, text stage, bundle-name prefix)
+NAMES = {"base": ("s", "text_t64", "dino"), "tiny": ("t", "tiny_text_t64", "dino-tiny")}
 
 
 def bf16(a: np.ndarray) -> np.ndarray:
@@ -78,15 +83,15 @@ def stage_dir(prec: str, name: str, used: dict) -> Path:
     d = ROOT / "build" / "stages" / prec / name
     if prec != "bf16" and not any(d.glob("*_mpk.tar.gz")):
         d = ROOT / "build" / "stages" / "bf16" / name
-    used[name.split("_", 1)[1] if name[0] == "s" and name[1:4].isdigit() else name] = d.parent.name
+    used[name.split("_", 1)[1] if name[0] in "st" and name[1:4].isdigit() else name] = d.parent.name
     return d
 
 
-def detector(S: int, prec: str, skip=(), fused=True):
+def detector(S: int, prec: str, skip=(), fused=True, model="base"):
     import dino_mla as M
-    from transformers import AutoModelForZeroShotObjectDetection
-    hf = AutoModelForZeroShotObjectDetection.from_pretrained("IDEA-Research/grounding-dino-base").eval()
-    out = ROOT / "build" / "bundles" / f"dino-{S}-{prec}"
+    hf = M.load_hf(model)
+    sp, _, bp = NAMES[model]
+    out = ROOT / "build" / "bundles" / f"{bp}-{S}-{prec}"
     if out.exists():
         shutil.rmtree(out)
     (out / "elf").mkdir(parents=True)
@@ -107,7 +112,7 @@ def detector(S: int, prec: str, skip=(), fused=True):
             e.update(src=st.src, dst=st.dst, dst_off=st.dst_off,
                      in_elems=int(np.prod(st.in_shape)), out_elems=int(np.prod(st.out_shape)))
             if "backbone" not in skip:
-                extract_elf(stage_dir(prec, f"s{S}_{st.name}", used), out / "elf" / f"{st.name}.elf")
+                extract_elf(stage_dir(prec, f"{sp}{S}_{st.name}", used), out / "elf" / f"{st.name}.elf")
         if st.op == "gather":
             e.update(src=st.src, dst=st.dst, dst_off=st.dst_off, k=st.k, c=st.c)
         if st.table is not None:
@@ -118,7 +123,7 @@ def detector(S: int, prec: str, skip=(), fused=True):
     for st in STAGES:
         if st in skip:
             continue
-        extract_elf(stage_dir(prec, f"s{S}_{st}", used), out / "elf" / f"{st}.elf")
+        extract_elf(stage_dir(prec, f"{sp}{S}_{st}", used), out / "elf" / f"{st}.elf")
     g = M.geometry(hf, S)
     bf16(M.tok_to_rows(g.pos).numpy()).tofile(out / "pos.bf16")
     g.ref.numpy().astype(np.float32).tofile(out / "ref.f32")
@@ -129,31 +134,32 @@ def detector(S: int, prec: str, skip=(), fused=True):
     iq.numpy().astype(np.float32).tofile(out / "invalid_query.f32")
     bf16(hf.model.query_position_embeddings.weight.detach().numpy()).tofile(out / "query_embed.bf16")
     starts = np.cumsum([0] + [h * w for h, w in g.shapes])[:-1]
-    finish(out, {"format": FORMAT, "model": "IDEA-Research/grounding-dino-base", "kind": "detector",
-                 "name": f"dino-{S}-{prec}", "requires": "dino-text-t64-bf16", "size": S, "precision": prec, "tokens": g.N, "queries": M.NQ, "text_tokens": M.T_TXT,
+    finish(out, {"format": FORMAT, "model": M.MODELS[model], "variant": model, "kind": "detector",
+                 "name": f"{bp}-{S}-{prec}", "requires": f"{bp}-text-t64-bf16", "size": S, "precision": prec, "tokens": g.N, "queries": M.NQ, "text_tokens": M.T_TXT,
                  "levels": [[h, w, int(s)] for (h, w), s in zip(g.shapes, starts)], "stages": STAGES,
                  "stage_precision": used,
                  "backbone": program})
 
 
-def text(prec: str):
+def text(prec: str, model="base"):
     from huggingface_hub import hf_hub_download
-    from transformers import AutoModelForZeroShotObjectDetection
-    hf = AutoModelForZeroShotObjectDetection.from_pretrained("IDEA-Research/grounding-dino-base").eval()
-    out = ROOT / "build" / "bundles" / f"dino-text-t64-{prec}"
+    import dino_mla as M
+    hf = M.load_hf(model)
+    _, ts, bp = NAMES[model]
+    out = ROOT / "build" / "bundles" / f"{bp}-text-t64-{prec}"
     if out.exists():
         shutil.rmtree(out)
     out.mkdir(parents=True)
-    extract_elf(ROOT / "build" / "stages" / prec / "text_t64", out / "text_t64.elf")
+    extract_elf(ROOT / "build" / "stages" / prec / ts, out / "text_t64.elf")
     for f in ("tokenizer.json", "vocab.txt"):
-        shutil.copy(hf_hub_download("IDEA-Research/grounding-dino-base", f), out / f)
+        shutil.copy(hf_hub_download(M.MODELS[model], f), out / f)
     e = hf.model.text_backbone.embeddings
     np.savez(out / "embeddings.npz",
              word=e.word_embeddings.weight.detach().numpy().astype(np.float16),
              position=e.position_embeddings.weight.detach().numpy().astype(np.float16),
              token_type=e.token_type_embeddings.weight.detach().numpy()[0].astype(np.float16))
-    finish(out, {"format": FORMAT, "model": "IDEA-Research/grounding-dino-base", "kind": "text",
-                 "name": f"dino-text-t64-{prec}",
+    finish(out, {"format": FORMAT, "model": M.MODELS[model], "variant": model, "kind": "text",
+                 "name": f"{bp}-text-t64-{prec}",
                  "precision": prec, "text_tokens": 64})
 
 
@@ -161,14 +167,15 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--size", type=int)
     ap.add_argument("--prec", default="bf16")
+    ap.add_argument("--model", default="base", choices=sorted(NAMES))
     ap.add_argument("--text", action="store_true")
     ap.add_argument("--skip", nargs="*", default=[], help="stages to leave out (debug bundles)")
     ap.add_argument("--unfused", action="store_true", help="27-program backbone with CPU gathers (old layout)")
     a = ap.parse_args()
     if a.text:
-        text(a.prec)
+        text(a.prec, a.model)
     if a.size:
-        detector(a.size, a.prec, set(a.skip), fused=not a.unfused)
+        detector(a.size, a.prec, set(a.skip), fused=not a.unfused, model=a.model)
 
 
 if __name__ == "__main__":

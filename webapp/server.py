@@ -68,6 +68,17 @@ class StudioError(Exception):
 UPSTREAM = "IDEA-Research/grounding-dino-base"
 FAMILY = "Grounding DINO Base"
 SPEED = {576: "Fast", 768: "Accurate"}
+# Each size of Grounding DINO this studio runs: upstream weights, name, parameters, backbone.
+VARIANTS = {
+    "base": {"upstream": UPSTREAM, "family": FAMILY, "short": "DINO-B", "params": "232.3 M", "swin": "Swin-B"},
+    "tiny": {"upstream": "IDEA-Research/grounding-dino-tiny", "family": "Grounding DINO Tiny", "short": "DINO-T",
+             "params": "172.2 M", "swin": "Swin-T"},
+}
+
+
+def variant_of(name: str, manifest: dict | None = None) -> str:
+    v = (manifest or {}).get("variant")
+    return v if v in VARIANTS else ("tiny" if name.startswith("dino-tiny") else "base")
 PREC_LABEL = {"bf16": "bf16", "w8a16": "int8 weights"}
 
 
@@ -81,18 +92,21 @@ def model_info(name: str | None, manifest: dict | None = None) -> dict | None:
         g = re.search(r"-(\d{3})-", name)
         size = int(g.group(1)) if g else None
     prec = m.get("precision") or (name.rsplit("-", 1)[-1] if "-" in name else "bf16")
+    v = VARIANTS[variant_of(name, m)]
     if m.get("kind") == "text" or "text" in name:
-        return {"name": name, "kind": "text", "title": f"{FAMILY} · Text Encoder (BERT Base)",
-                "short": "Text Encoder", "precision": prec, "upstream": UPSTREAM,
+        return {"name": name, "kind": "text", "title": f"{v['family']} · Text Encoder (BERT Base)",
+                "short": "Text Encoder", "precision": prec, "upstream": v["upstream"], "variant": variant_of(name, m),
                 "details": f"BERT Base (110 M parameters) + projection · 64 text tokens · {prec} · 1 ELF"}
     elfs = len(m.get("stages", [])) + sum(1 for st in m.get("backbone", []) if st.get("op") == "run")
-    speed = SPEED.get(size, "")
+    speed = SPEED.get(size, "") if v is VARIANTS["base"] else ""
     pl = PREC_LABEL.get(prec, prec)
     how = {"w8a16": "int8 weights for the backbone and encoder, bf16 activations"}.get(prec, prec)
-    return {"name": name, "kind": "detector", "size": size, "precision": prec, "upstream": UPSTREAM,
-            "title": f"{FAMILY} · {speed} {size} px · {pl}".replace("  ", " "),
-            "short": f"DINO-B {size}" + (" int8" if prec == "w8a16" else ""),
-            "details": f"{UPSTREAM} · Grounding DINO Base, 232.3 M parameters (Swin-B + BERT Base) · {size}×{size} input · {how}"
+    return {"name": name, "kind": "detector", "size": size, "precision": prec, "upstream": v["upstream"],
+            "variant": variant_of(name, m),
+            "title": f"{v['family']} · {speed} {size} px · {pl}".replace("  ", " "),
+            "short": f"{v['short']} {size}" + (" int8" if prec == "w8a16" else ""),
+            "details": f"{v['upstream']} · {v['family']}, {v['params']} parameters ({v['swin']} + BERT Base) · "
+                       f"{size}×{size} input · {how}"
                        + (f" · {elfs} ELFs + text encoder" if elfs else "")}
 
 
@@ -453,9 +467,12 @@ class Studio:
 
     @staticmethod
     def _title(meta, name):
+        tiny = variant_of(name, meta) == "tiny"
         if meta.get("kind") == "text":
-            return "Text Encoder · BERT (64 Tokens)"
+            return "Tiny Text Encoder · BERT (64 Tokens)" if tiny else "Text Encoder · BERT (64 Tokens)"
         size = meta.get("size")
+        if tiny:
+            return f"Tiny · {size} px" if size else name
         return {768: "Accurate · 768 px", 576: "Fast · 576 px"}.get(size, name)
 
     def status(self) -> dict:

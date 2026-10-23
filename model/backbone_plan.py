@@ -26,16 +26,16 @@ import torch.nn.functional as F
 
 import dino_mla as M
 
-WS = 12
+WS = 12          # Swin-B defaults; build() reads the model's own window size and shift
 SHIFT = 6
 
 
-def layout(Hp, Wp, shifted):
+def layout(Hp, Wp, shifted, ws=WS, shift=SHIFT):
     """Token order of a window layout: entry t = spatial index (y * Wp + x) of token t."""
     idx = torch.arange(Hp * Wp, dtype=torch.float64).view(1, 1, Hp, Wp)
     if shifted:
-        idx = M.roll_hw(idx, -SHIFT)
-    return M.window_partition(idx, WS).reshape(-1).long().numpy()
+        idx = M.roll_hw(idx, -shift)
+    return M.window_partition(idx, ws).reshape(-1).long().numpy()
 
 
 def inverse(order, n):
@@ -88,16 +88,16 @@ def build(hf, S):
     sw = hf.model.backbone.conv_encoder.model
     L = sw.encoder.layers
     ref = M.BackboneStage(hf, S)        # for the GN-converted input projections
+    WS, SHIFT, chans, _ = M.swin_cfg(hf)
     dims = [S // 4, S // 8, S // 16, S // 32]
     pads = [-(-d // WS) * WS for d in dims]
-    chans = [128, 256, 512, 1024]
     shapes = M.level_shapes(S)
     level_off = np.cumsum([0] + [h * w for h, w in shapes])
     steps: list[Step] = []
     lay = {}
     for s in range(4):
         for sh in (0, 1):
-            lay[s, sh] = layout(pads[s], pads[s], sh)
+            lay[s, sh] = layout(pads[s], pads[s], sh, WS, SHIFT)
 
     # stage 1 input: patch pixels in L0 order
     steps.append(Step("patchify", "patchify", table=lay[0, 0], c=48, extra={"grid": pads[0]}))

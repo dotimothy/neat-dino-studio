@@ -90,13 +90,12 @@ class TorchBackend(Backend):
     """HF reference on a PC (CUDA when available). Same letterbox and prompt handling as the board."""
     name = "torch"
 
-    def __init__(self, size=576, device=None):
+    def __init__(self, size=576, device=None, model="IDEA-Research/grounding-dino-base"):
         import torch
         from transformers import AutoModelForZeroShotObjectDetection
         self.torch = torch
         self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
-        self.model = AutoModelForZeroShotObjectDetection.from_pretrained(
-            "IDEA-Research/grounding-dino-base").eval().to(self.device)
+        self.model = AutoModelForZeroShotObjectDetection.from_pretrained(model).eval().to(self.device)
         self.size = size
         self.tokenizer = P.Tokenizer()
         self.pr = None

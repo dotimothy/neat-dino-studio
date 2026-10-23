@@ -30,10 +30,10 @@ def main():
     ap.add_argument("--size", type=int, default=768)
     ap.add_argument("--image", default=str(ROOT / "data/images/cats.jpg"))
     ap.add_argument("--prompt", default="a cat. a remote control.")
+    ap.add_argument("--model", default="base", choices=sorted(M.MODELS))
     a = ap.parse_args()
     from PIL import Image
-    from transformers import AutoModelForZeroShotObjectDetection
-    hf = AutoModelForZeroShotObjectDetection.from_pretrained("IDEA-Research/grounding-dino-base").eval()
+    hf = M.load_hf(a.model)
     tok = P.Tokenizer()
     pr = P.build(a.prompt, tok)
     img = Image.open(a.image).convert("RGB")

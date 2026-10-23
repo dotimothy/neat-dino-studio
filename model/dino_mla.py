@@ -211,6 +211,27 @@ def swin_shift_mask(Hp, Wp, ws, shift):
     return m.permute(2, 0, 1).unsqueeze(0).contiguous()   # (1, k, nW, q)
 
 
+# Grounding DINO sizes this repo builds. Both share the BERT-base text encoder architecture and the
+# 256-wide deformable transformer; they differ in the Swin backbone (and in all trained weights).
+MODELS = {"base": "IDEA-Research/grounding-dino-base",      # Swin-B: ws 12, dims 128..1024, depths 2-2-18-2
+          "tiny": "IDEA-Research/grounding-dino-tiny"}      # Swin-T: ws 7, dims 96..768, depths 2-2-6-2
+
+
+def load_hf(variant="base"):
+    from transformers import AutoModelForZeroShotObjectDetection
+    return AutoModelForZeroShotObjectDetection.from_pretrained(MODELS[variant]).eval()
+
+
+def variant_of(hf) -> str:
+    return "tiny" if hf.config.backbone_config.embed_dim == 96 else "base"
+
+
+def swin_cfg(hf):
+    """(window size, shift, channels per stage, blocks per stage) of the Swin backbone."""
+    c = hf.config.backbone_config
+    return c.window_size, c.window_size // 2, [c.embed_dim * 2 ** i for i in range(4)], list(c.depths)
+
+
 class SwinBlock(nn.Module):
     def __init__(self, layer, H, W, ws=12):
         super().__init__()
@@ -324,8 +345,9 @@ class PatchEmbed(nn.Module):
     def __init__(self, sw):
         super().__init__()
         pe = sw.embeddings.patch_embeddings.projection
-        self.patch = nn.Conv2d(48, 128, 1)
-        self.patch.weight.data.copy_(pe.weight.detach().reshape(128, 48)[:, :, None, None])
+        c = pe.weight.shape[0]                                # 128 (Swin-B) or 96 (Swin-T)
+        self.patch = nn.Conv2d(48, c, 1)
+        self.patch.weight.data.copy_(pe.weight.detach().reshape(c, 48)[:, :, None, None])
         self.patch.bias.data.copy_(pe.bias.detach())
         self.ln = LN(sw.embeddings.norm)
 
@@ -374,7 +396,7 @@ def level_shapes(S):
 
 
 class BackboneStage(nn.Module):
-    """Swin-B + input_proj (+GN) + stride-64 level -> tokens (1, 256, 1, N).
+    """Swin (B or T) + input_proj (+GN) + stride-64 level -> tokens (1, 256, 1, N).
 
     in: (1, 48, S/4, S/4) = space_to_depth(normalised image, 4), channel (c, py, px).
     """
@@ -382,17 +404,19 @@ class BackboneStage(nn.Module):
     def __init__(self, hf, S):
         super().__init__()
         sw = hf.model.backbone.conv_encoder.model
-        pe = sw.embeddings.patch_embeddings.projection        # Conv2d(3, 128, 4, 4)
-        w = pe.weight.detach()                                # (128, 3, 4, 4)
-        self.patch = nn.Conv2d(48, 128, 1)
-        self.patch.weight.data.copy_(w.reshape(128, 48)[:, :, None, None])
+        pe = sw.embeddings.patch_embeddings.projection        # Conv2d(3, C, 4, 4)
+        w = pe.weight.detach()                                # (C, 3, 4, 4)
+        c = w.shape[0]
+        ws = swin_cfg(hf)[0]
+        self.patch = nn.Conv2d(48, c, 1)
+        self.patch.weight.data.copy_(w.reshape(c, 48)[:, :, None, None])
         self.patch.bias.data.copy_(pe.bias.detach())
         self.emb_ln = LN(sw.embeddings.norm)
         self.stages = nn.ModuleList()
         self.merges = nn.ModuleList()
         H = S // 4
         for st in sw.encoder.layers:
-            self.stages.append(nn.ModuleList([SwinBlock(b, H, H) for b in st.blocks]))
+            self.stages.append(nn.ModuleList([SwinBlock(b, H, H, ws) for b in st.blocks]))
             self.merges.append(PatchMerge(st.downsample) if st.downsample is not None else nn.Identity())
             H = H // 2 if st.downsample is not None else H
         self.out_ln = nn.ModuleList([LN(sw.hidden_states_norms[s]) for s in ("stage2", "stage3", "stage4")])

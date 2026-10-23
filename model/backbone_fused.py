@@ -1,4 +1,6 @@
-"""The Swin-B backbone as 9 MLA programs and no CPU steps (besides patchify).
+"""The Swin backbone (Swin-B for grounding-dino-base, Swin-T for -tiny) as fused MLA programs.
+
+Swin-B makes 9 programs (stage 3's 18 blocks in groups of 6), Swin-T 7 (stage 3 is 6 blocks).
 
 Every program works on tokens in plain window layout; the plain <-> shifted moves, Swin patch
 merging and the return to image order are all Slice/Concat (and spatial-only reshapes) on the
@@ -20,17 +22,20 @@ import torch.nn as nn
 
 import dino_mla as M
 import swin_shift_mla as SS
-from backbone_plan import Step, LevelProj, Level23, layout, inverse, WS
+from backbone_plan import Step, LevelProj, Level23, layout, inverse
+
+STAGE3_GROUP = 6          # Swin blocks per stage-3 program
 
 
 class SwinGroup(nn.Module):
     """Consecutive Swin blocks on plain-layout tokens; shifted blocks move to the shifted layout and back."""
 
-    def __init__(self, blocks, H, embed=None, merge=None, nh_prev=None):
+    def __init__(self, blocks, H, ws, shift, embed=None, merge=None, nh_prev=None):
         super().__init__()
         self.embed, self.merge, self.nh_prev = embed, merge, nh_prev
-        self.blocks = nn.ModuleList(M.SwinBlockW(b, H, H, WS) for b in blocks)
-        self.n = -(-H // WS)
+        self.ws, self.shift = ws, shift
+        self.blocks = nn.ModuleList(M.SwinBlockW(b, H, H, ws) for b in blocks)
+        self.n = -(-H // ws)
 
     def forward(self, x):
         if self.embed is not None:
@@ -41,7 +46,8 @@ class SwinGroup(nn.Module):
             x = self.merge.red(self.merge.ln(x))
         for b in self.blocks:
             if b.shift:
-                x = SS.shifted_to_plain(b(SS.plain_to_shifted(x, self.n, self.n)), self.n, self.n)
+                x = SS.shifted_to_plain(b(SS.plain_to_shifted(x, self.n, self.n, self.ws, b.shift)),
+                                        self.n, self.n, self.ws, b.shift)
             else:
                 x = b(x)
         return x
@@ -67,18 +73,19 @@ class Level23Spatial(nn.Module):
         return self.l23(SS.unpartition(x, self.n, self.n, self.H, self.H))
 
 
-def build(hf, S, stage3_groups=3):
+def build(hf, S, stage3_groups=None):
     sw = hf.model.backbone.conv_encoder.model
     L = sw.encoder.layers
     ref = M.BackboneStage(hf, S)
+    WS, SH, chans, depths = M.swin_cfg(hf)
+    stage3_groups = stage3_groups or max(1, depths[2] // STAGE3_GROUP)
     dims = [S // 4, S // 8, S // 16, S // 32]
     pads = [-(-d // WS) * WS for d in dims]
     ns = [p // WS for p in pads]
-    chans = [128, 256, 512, 1024]
     shapes = M.level_shapes(S)
     off = np.cumsum([0] + [h * w for h, w in shapes])
     nW = [n * n for n in ns]
-    steps = [Step("patchify", "patchify", table=layout(pads[0], pads[0], 0), c=48, extra={"grid": pads[0]})]
+    steps = [Step("patchify", "patchify", table=layout(pads[0], pads[0], 0, WS, SH), c=48, extra={"grid": pads[0]})]
     tok = lambda s, c: (1, c, nW[s], WS * WS)                                   # noqa: E731
     bufs = iter(["A", "B"] * 8)
     cur = next(bufs)
@@ -91,8 +98,8 @@ def build(hf, S, stage3_groups=3):
         if dst is None:
             cur = d
 
-    run("bb_stage1", SwinGroup(L[0].blocks, dims[0], embed=M.PatchEmbed(sw)), tok(0, 48), tok(0, 128))
-    run("bb_stage2", SwinGroup(L[1].blocks, dims[1], merge=M.PatchMerge(L[0].downsample), nh_prev=ns[0]),
+    run("bb_stage1", SwinGroup(L[0].blocks, dims[0], WS, SH, embed=M.PatchEmbed(sw)), tok(0, 48), tok(0, 128))
+    run("bb_stage2", SwinGroup(L[1].blocks, dims[1], WS, SH, merge=M.PatchMerge(L[0].downsample), nh_prev=ns[0]),
         tok(0, 128), tok(1, 256))
     run("bb_proj0", ProjSpatial(LevelProj(sw.hidden_states_norms["stage2"], ref.proj[0]), ns[1], dims[1]),
         tok(1, 256), (1, M.D, dims[1], dims[1]), dst="X", dst_off=int(off[0]))
@@ -100,12 +107,12 @@ def build(hf, S, stage3_groups=3):
     k = len(blocks3) // stage3_groups
     for g in range(stage3_groups):
         first = g == 0
-        grp = SwinGroup(blocks3[g * k:(g + 1) * k], dims[2], merge=M.PatchMerge(L[1].downsample) if first else None,
+        grp = SwinGroup(blocks3[g * k:(g + 1) * k], dims[2], WS, SH, merge=M.PatchMerge(L[1].downsample) if first else None,
                         nh_prev=ns[1] if first else None)
         run(f"bb_stage3{'abcdefgh'[g]}", grp, tok(1, 256) if first else tok(2, 512), tok(2, 512))
     run("bb_proj1", ProjSpatial(LevelProj(sw.hidden_states_norms["stage3"], ref.proj[1]), ns[2], dims[2]),
         tok(2, 512), (1, M.D, dims[2], dims[2]), dst="X", dst_off=int(off[1]))
-    run("bb_stage4", SwinGroup(L[3].blocks, dims[3], merge=M.PatchMerge(L[2].downsample), nh_prev=ns[2]),
+    run("bb_stage4", SwinGroup(L[3].blocks, dims[3], WS, SH, merge=M.PatchMerge(L[2].downsample), nh_prev=ns[2]),
         tok(2, 512), tok(3, 1024))
     n23 = shapes[2][0] * shapes[2][1] + shapes[3][0] * shapes[3][1]
     run("bb_level23", Level23Spatial(Level23(sw.hidden_states_norms["stage4"], ref.proj[2], ref.proj[3]),
@@ -113,7 +120,7 @@ def build(hf, S, stage3_groups=3):
     return steps
 
 
-def build_cpu_merge(hf, S, stage3_groups=3):
+def build_cpu_merge(hf, S, stage3_groups=None):
     """Swin stages fused on the MLA (window shifts inside), with patch merging and the return to
     image order done by CPU gathers: on the board, the MLA computes the strided slices of
     merge_windows and the reshape of unpartition wrongly (sima-frontend 2.1.3), although both
@@ -121,13 +128,15 @@ def build_cpu_merge(hf, S, stage3_groups=3):
     sw = hf.model.backbone.conv_encoder.model
     L = sw.encoder.layers
     ref = M.BackboneStage(hf, S)
+    WS, SH, chans, depths = M.swin_cfg(hf)
+    stage3_groups = stage3_groups or max(1, depths[2] // STAGE3_GROUP)
     dims = [S // 4, S // 8, S // 16, S // 32]
     pads = [-(-d // WS) * WS for d in dims]
     ns = [p // WS for p in pads]
     shapes = M.level_shapes(S)
     off = np.cumsum([0] + [h * w for h, w in shapes])
     nW = [n * n for n in ns]
-    plain = [layout(pads[i], pads[i], 0) for i in range(4)]
+    plain = [layout(pads[i], pads[i], 0, WS, SH) for i in range(4)]
     inv = [inverse(plain[i], pads[i] * pads[i]) for i in range(4)]
     tok = lambda s, c: (1, c, nW[s], WS * WS)                                   # noqa: E731
     steps = [Step("patchify", "patchify", table=plain[0], c=48, extra={"grid": pads[0]})]
@@ -150,32 +159,43 @@ def build_cpu_merge(hf, S, stage3_groups=3):
         rows = (np.arange(H)[:, None] * Hp + np.arange(H)[None, :]).reshape(-1)
         steps.append(Step("gather", name, src=src, dst=dst, dst_off=dst_off, table=inv[s][rows], k=1, c=c))
 
-    run("bb_stage1", SwinGroup(L[0].blocks, dims[0], embed=M.PatchEmbed(sw)), "A", "B", tok(0, 48), tok(0, 128))
-    merge(0, "B", "A", 128)
-    run("bbm_stage2", SwinGroup(L[1].blocks, dims[1], merge=M.PatchMerge(L[0].downsample)), "A", "B",
-        tok(1, 512), tok(1, 256))
-    run("bbm_proj0", LevelProj(sw.hidden_states_norms["stage2"], ref.proj[0]), "B", "P", tok(1, 256), tok(1, M.D))
-    rowmajor(1, "P", "X", M.D, int(off[0]), "level0_rowmajor")
-    merge(1, "B", "A", 256)
+    def level(s, lv, src):
+        """Stage output -> encoder level lv. The projection ends in a GroupNorm, whose statistics
+        must not see padding tokens: a padded stage (Swin-T's 7-px windows at 576) goes to image
+        order first, and the projection runs on that."""
+        lp = LevelProj(sw.hidden_states_norms[f"stage{s + 1}"], ref.proj[lv])
+        H = dims[s]
+        if pads[s] == H:
+            run(f"bbm_proj{lv}", lp, src, "P", tok(s, chans[s]), tok(s, M.D))
+            rowmajor(s, "P", "X", M.D, int(off[lv]), f"level{lv}_rowmajor")
+        else:
+            rowmajor(s, src, "P", chans[s], 0, f"stage{s + 1}_rowmajor")
+            run(f"bbm_proj{lv}", lp, "P", "X", (1, chans[s], H, H), (1, M.D, H, H), dst_off=int(off[lv]))
+
+    run("bb_stage1", SwinGroup(L[0].blocks, dims[0], WS, SH, embed=M.PatchEmbed(sw)), "A", "B", tok(0, 48), tok(0, chans[0]))
+    merge(0, "B", "A", chans[0])
+    run("bbm_stage2", SwinGroup(L[1].blocks, dims[1], WS, SH, merge=M.PatchMerge(L[0].downsample)), "A", "B",
+        tok(1, 4 * chans[0]), tok(1, chans[1]))
+    level(1, 0, "B")
+    merge(1, "B", "A", chans[1])
     blocks3 = list(L[2].blocks)
     k = len(blocks3) // stage3_groups
     cur = "A"
     for g in range(stage3_groups):
         first = g == 0
-        grp = SwinGroup(blocks3[g * k:(g + 1) * k], dims[2], merge=M.PatchMerge(L[1].downsample) if first else None)
+        grp = SwinGroup(blocks3[g * k:(g + 1) * k], dims[2], WS, SH, merge=M.PatchMerge(L[1].downsample) if first else None)
         nxt = "B" if cur == "A" else "A"
         run(("bbm_stage3a" if first else f"bb_stage3{'abcdefgh'[g]}"), grp, cur, nxt,
-            tok(2, 1024) if first else tok(2, 512), tok(2, 512))
+            tok(2, 4 * chans[1]) if first else tok(2, chans[2]), tok(2, chans[2]))
         cur = nxt
-    run("bbm_proj1", LevelProj(sw.hidden_states_norms["stage3"], ref.proj[1]), cur, "P", tok(2, 512), tok(2, M.D))
-    rowmajor(2, "P", "X", M.D, int(off[1]), "level1_rowmajor")
+    level(2, 1, cur)
     other = "B" if cur == "A" else "A"
-    merge(2, cur, other, 512)
+    merge(2, cur, other, chans[2])
     fin = "B" if other == "A" else "A"
-    run("bbm_stage4", SwinGroup(L[3].blocks, dims[3], merge=M.PatchMerge(L[2].downsample)), other, fin,
-        tok(3, 2048), tok(3, 1024))
-    rowmajor(3, fin, other, 1024, 0, "stage4_spatial")
+    run("bbm_stage4", SwinGroup(L[3].blocks, dims[3], WS, SH, merge=M.PatchMerge(L[2].downsample)), other, fin,
+        tok(3, 4 * chans[2]), tok(3, chans[3]))
+    rowmajor(3, fin, other, chans[3], 0, "stage4_spatial")
     n23 = shapes[2][0] * shapes[2][1] + shapes[3][0] * shapes[3][1]
     run("bbm_level23", Level23(sw.hidden_states_norms["stage4"], ref.proj[2], ref.proj[3]), other, "X",
-        (1, 1024, dims[3], dims[3]), (1, M.D, 1, n23), dst_off=int(off[2]))
+        (1, chans[3], dims[3], dims[3]), (1, M.D, 1, n23), dst_off=int(off[2]))
     return steps

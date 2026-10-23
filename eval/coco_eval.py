@@ -68,7 +68,7 @@ def run(a):
     if a.backend == "torch":
         sys.path.insert(0, str(ROOT / "app"))
         from app.backends import TorchBackend
-        be = TorchBackend(a.size)
+        be = TorchBackend(a.size, model=f"IDEA-Research/grounding-dino-{a.model}")
         tok = be.tokenizer
         set_prompt = be.set_prompt
 
@@ -144,6 +144,7 @@ def main():
     r = sub.add_parser("run")
     r.add_argument("--backend", choices=["torch", "mla"], required=True)
     r.add_argument("--size", type=int, default=576)
+    r.add_argument("--model", default="base", choices=["base", "tiny"], help="torch reference weights")
     r.add_argument("--images", default=str(COCO / "val2017"))
     r.add_argument("--ids", default=str(COCO / "subset500.txt"))
     r.add_argument("--n", type=int, default=500)

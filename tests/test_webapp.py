@@ -75,3 +75,12 @@ def test_parse_and_assist(client):
 def test_static(client):
     assert client.get("/").status_code == 200
     assert client.get("/static/app.js").status_code == 200
+
+
+def test_model_names_per_variant():
+    b = server.model_info("dino-576-bf16", {"kind": "detector", "size": 576, "precision": "bf16"})
+    t = server.model_info("dino-tiny-576-bf16", {"kind": "detector", "size": 576, "precision": "bf16", "variant": "tiny"})
+    assert b["title"].startswith("Grounding DINO Base · Fast 576") and b["short"] == "DINO-B 576"
+    assert t["title"].startswith("Grounding DINO Tiny · 576") and t["short"] == "DINO-T 576"
+    assert "172.2 M" in t["details"] and "grounding-dino-tiny" in t["upstream"]
+    assert server.model_info("dino-tiny-text-t64-bf16")["title"].startswith("Grounding DINO Tiny · Text")
