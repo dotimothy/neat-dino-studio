@@ -24,3 +24,8 @@ target_include_directories(dino_rt PRIVATE include ${JSONCPP_INCLUDE_DIR})
 target_link_libraries(dino_rt PRIVATE SimaLMM::sima_lmm_runtime OpenMP::OpenMP_CXX)
 target_compile_options(dino_rt PRIVATE ${DINO_FLAGS})
 install(TARGETS dino_rt RUNTIME DESTINATION bin)
+
+add_executable(msda_bench tests/msda_bench.cpp)
+target_include_directories(msda_bench PRIVATE include)
+target_link_libraries(msda_bench PRIVATE OpenMP::OpenMP_CXX)
+target_compile_options(msda_bench PRIVATE ${DINO_FLAGS})

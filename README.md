@@ -1,0 +1,90 @@
+<p align="center"><img src="webapp/web/assets/neat-dino.svg" width="96" alt=""></p>
+
+<h1 align="center">Neat DINO Studio</h1>
+
+<p align="center">Open-vocabulary object detection with <a href="https://huggingface.co/IDEA-Research/grounding-dino-base">Grounding DINO</a> on the SiMa.ai Modalix MLA.<br>
+Type what to find — <code>person . red car . dog with a frisbee .</code> — and get boxes, from a photo or a live webcam.</p>
+
+![Neat DINO Studio](docs/screenshot.png)
+
+## What it does
+
+- **Any phrase, not a fixed class list.** Grounding DINO matches boxes to the words you type; each phrase gets its own color.
+- **Photo or webcam.** Upload, paste or drop a photo, or open the webcam and go live. Changing only the prompt reruns on the same image without re-running the backbone.
+- **Thresholds on the fly.** Box and phrase score sliders filter on the page, without another run.
+- **Model manager.** Download, verify, load and delete models from Hugging Face in Settings → Models. One detector runs on the MLA at a time.
+- **Two sizes.** *Fast* (576 px) for the webcam, *Accurate* (768 px) for small objects. Both are bf16.
+
+## Install (Modalix DevKit)
+
+```bash
+cd /media/nvme
+curl -fsSL https://raw.githubusercontent.com/dotimothy/neat-dino-studio/main/install.sh | bash
+cd neat-dino-studio && ./setup.sh          # builds the runtime, fetches the Fast model, HTTPS cert, alias
+neat-dino                                  # (new shell) then open https://<board-ip>:8092/
+```
+
+`setup.sh --fetch accurate|all` fetches more models; `webapp/run.sh --daemon` runs it in the
+background and `webapp/run.sh --stop` stops it (freeing the MLA). `neat-dino update` updates in place.
+The page also works over plain HTTP, but browsers only allow the webcam on HTTPS; the studio
+serves both on the same port with a self-signed certificate (accept the warning once).
+
+Requirements: the NEAT SDK on the DevKit (SimaLMM runtime `sima-lmm-dev`, Python 3 with numpy,
+Pillow, Flask — the `~/pyneat` venv has them), cmake and g++. About 700 MB of free MLA memory:
+stop other MLA apps first.
+
+## How it runs on the MLA
+
+Grounding DINO base is 232 M parameters: a Swin-B backbone, a BERT-base text encoder and a
+6+6-layer deformable transformer. Two parts of it do not map onto the MLA: multi-scale
+deformable attention samples at data-dependent points (the MLA's GridSample handles maps up to
+32 px wide, at ~0.3 µs a sample), and the two-stage query selection needs a top-900 over all
+image tokens. So the network is cut into MLA programs, and the board's Arm cores do the rest:
+
+| On the MLA (bf16, one ELF each) | On the A65 cores |
+|---|---|
+| Text encoder (BERT + projection), once per prompt | Tokenizing, phrase masks, text position embedding |
+| Swin-B as 27 programs (24 blocks + level projections) | Moving Swin tokens between plain and shifted windows, patch merging |
+| 7 encoder programs (fusion, text enhancer, deformable projections) | Deformable-attention sampling (NEON, 16 threads) |
+| Decoder value maps + 12 decoder programs | Top-900 selection, reference-box updates, sine embeddings |
+
+`runtime/` (`dino_rt`) runs the ELFs with SimaLMM's `MLAModelWithBuffer` and reads and writes
+their bf16 buffers in place, so there are no copies through the EV74 between stages. The web
+app (`webapp/server.py`) talks to it as a child process; unloading a model stops it cleanly.
+
+Accuracy: on the board, bf16 detections match the FP32 PyTorch model box for box (IoU ≥ 0.98
+on the top detections, scores within ±0.04). See `report.md` for numbers.
+
+## Build it yourself
+
+Everything that produces the models is here:
+
+```
+model/dino_mla.py        Grounding DINO rebuilt in MLA-friendly ops, stage by stage (checked against HF)
+model/backbone_plan.py   the window-layout Swin-B program
+model/export_onnx.py     ONNX per stage, with real inputs/outputs for board checks
+compile/                 SiMa Model Compiler driver (bf16, MLA tessellation), probes, board checks
+tools/make_bundle.py     ELFs + tables + constants -> a runtime bundle
+tools/publish_hub.py     bundles -> Hugging Face (models.json)
+runtime/                 dino_rt (C++, SimaLMM)
+webapp/                  the studio (Flask + plain JS, no build step)
+```
+
+```bash
+.venv/bin/python model/check_mirror.py --size 768           # the rebuild vs transformers, FP32
+.venv/bin/python model/export_onnx.py --size 576 --all      # ONNX for every stage
+compile/build_stages.sh 576                                 # compile them all (NEAT SDK container)
+.venv/bin/python tools/make_bundle.py --size 576 --text     # bundles in build/bundles/
+BOARD=sima@<board-ip> ./deploy.sh --models --build          # to a DevKit
+```
+
+## Prompt assist (LLiMa)
+
+`app/assist.py` is the hook for an LLM that rewrites requests into detection prompts
+("anything I could sit on" → `chair . sofa . bench .`). Nothing ships yet; the Assist button
+appears when an assist is configured.
+
+## License
+
+Apache-2.0. Grounding DINO © IDEA Research (Apache-2.0); BERT and Swin weights as distributed
+with it. Inter and JetBrains Mono fonts under the SIL Open Font License.

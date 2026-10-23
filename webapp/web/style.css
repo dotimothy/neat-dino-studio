@@ -178,7 +178,7 @@ a { color: var(--accent); }
 }
 .chip .sw { width: 9px; height: 9px; border-radius: 3px; }
 .chip.off { opacity: .45; text-decoration: line-through; }
-.chip.example { font-weight: 500; color: var(--text-2); }
+.chip.example { font-weight: 500; color: var(--text-2); max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; display: inline-block; line-height: 24px; }
 .chip.example:hover { border-color: var(--accent); color: var(--text); }
 .chip .n { font-family: var(--code-font); color: var(--text-3); font-weight: 400; }
 .hint { font-size: 12.5px; color: var(--text-3); margin-top: 8px; }
@@ -261,4 +261,15 @@ dialog::backdrop { background: rgba(5, 8, 12, .55); backdrop-filter: blur(3px); 
   .modal-shell { flex-direction: column; }
   .modal-nav { width: 100%; flex-direction: row; overflow-x: auto; padding: 8px; }
   .modal-title { display: none; }
+}
+@media (max-width: 600px) {
+  .app-header { padding: 0 10px; gap: 6px; }
+  .brand-mark { width: 30px; height: 30px; }
+  .brand-title { font-size: 15px; }
+  .brand-neat { display: none; }
+  .model-pill { max-width: 140px; padding: 0 10px; }
+  .model-pill #model-name { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .pill-ms { display: none; }
+  .icon-btn { width: 32px; height: 32px; }
+  #full-btn { display: none; }
 }

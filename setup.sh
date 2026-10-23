@@ -54,8 +54,8 @@ else
   bad "SimaLMM not found (install the NEAT SDK's sima-lmm-dev package)"; fail=1
 fi
 for t in cmake g++; do command -v $t >/dev/null && ok "$t" || { bad "$t missing"; fail=1; }; done
-cma="$(awk '/CmaFree/ {printf "%d", $2/1024}' /proc/meminfo 2>/dev/null || echo 0)"
-[[ "$cma" -gt 700 ]] && ok "MLA memory free: ${cma} MB" || warn "MLA memory free: ${cma} MB (a detector needs about 700 MB; stop other MLA apps)"
+busy="$(pgrep -af '[n]eat-genai-studio|[l]aya/|[n]eat-change-studio/webapp|[c]yws/webapp|[l]lima run' || true)"
+[[ -z "$busy" ]] && ok "no other MLA app running" || warn "another MLA app is running; stop it before starting the studio"
 
 step "Python"
 if "$PY" -c "import numpy, PIL, flask" 2>/dev/null; then

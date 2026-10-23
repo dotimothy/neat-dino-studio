@@ -431,6 +431,9 @@ class BiAttn(nn.Module):
         self.tv = conv_from_linear(a.values_text_proj)
         self.vo = conv_from_linear(a.out_vision_proj)
         self.tout = conv_from_linear(a.out_text_proj)
+        self.tv_chunks = 1
+        self.expand = nn.Conv2d(1, self.hd, 1, bias=False)          # (1,1,h,w) -> (1,hd,h,w), ones
+        self.expand.weight.data.fill_(1.0)
 
     def forward(self, v, t, tmask_c):
         qv = heads_to_h(self.vq(v), self.hd)     # (1, hd, 4, N)
@@ -441,8 +444,28 @@ class BiAttn(nn.Module):
         s_vt = torch.einsum("nchw,nchq->nqhw", qv, kt) + tmask_c
         ov = torch.einsum("nchw,nqhc->nqhw", torch.softmax(s_vt, 1), vt)
         # text -> vision: scores (1, N, 4, 64), softmax over vision (C)
-        s_tv = torch.einsum("nchw,nchq->nqhw", kt, qv)
-        ot = torch.einsum("nchw,nqhc->nqhw", torch.softmax(s_tv, 1), vv)
+        if self.tv_chunks <= 1:
+            s_tv = torch.einsum("nchw,nchq->nqhw", kt, qv)
+            ot = torch.einsum("nchw,nqhc->nqhw", torch.softmax(s_tv, 1), vv)
+        else:
+            # The MLA's channel softmax fails beyond ~7k channels (768: N = 12240). Softmax is
+            # exp(s) / sum(exp(s)) without the max shift, exact as long as exp(s) stays finite
+            # (scores measured within -25..15); sum it over chunks of vision tokens.
+            num = den = None
+            # Uneven chunk sizes: equal ones-constants get merged into one initializer, and the
+            # compiler then names two loaders for it alike ("Layer names are not unique").
+            N = qv.shape[3]
+            base = -(-N // self.tv_chunks // 16) * 16
+            sizes = [base + 16 * (self.tv_chunks - 1 - i) for i in range(self.tv_chunks - 1)]
+            sizes.append(N - sum(sizes))
+            for q_i, v_i in zip(torch.split(qv, sizes, 3), torch.split(vv, sizes, 3)):
+                e = torch.exp(torch.einsum("nchw,nchq->nqhw", kt, q_i))          # (1, Ni, 4, 64)
+                n_i = torch.einsum("nchw,nqhc->nqhw", e, v_i)                    # (1, hd, 4, 64)
+                ones = torch.ones(1, 1, q_i.shape[2], q_i.shape[3])
+                d_i = torch.einsum("nchw,nqhc->nqhw", e, ones)                   # (1, 1, 4, 64)
+                num = n_i if num is None else num + n_i
+                den = d_i if den is None else den + d_i
+            ot = num * torch.reciprocal(self.expand(den))
         return self.vo(h_to_heads(ov)), self.tout(h_to_heads(ot))
 
 
@@ -521,6 +544,7 @@ class EncStage(nn.Module):
         self.post = EncLayerPost(enc[k - 1]) if k > 0 else None
         if k < 6:
             self.pre = EncLayerPre(enc[k])
+            self.pre.bi.tv_chunks = -(-N // 7000)       # 576: 1 (plain softmax), 768: 2
         else:
             m = hf.model
             self.enc_out = conv_from_linear(m.enc_output)

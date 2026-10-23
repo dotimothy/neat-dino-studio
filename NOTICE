@@ -1,0 +1,12 @@
+Neat DINO Studio
+Copyright 2026 Timothy Do
+
+This product runs Grounding DINO (IDEA-Research/grounding-dino-base),
+Copyright IDEA Research, licensed under the Apache License 2.0, with the
+BERT (google-bert/bert-base-uncased) and Swin Transformer weights it contains.
+
+The model code in model/ adapts transformers' modeling_grounding_dino.py and
+modeling_swin.py (Copyright The HuggingFace Team, Apache License 2.0).
+
+Fonts: Inter and JetBrains Mono, SIL Open Font License 1.1
+(webapp/web/assets/fonts/OFL-*.txt).

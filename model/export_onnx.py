@@ -35,7 +35,8 @@ ALL = ["text", "backbone"] + [f"enc{k}" for k in range(7)] + ["dec_values"] + \
 
 # Ops the MLA build may contain (anything else is a red flag before compiling).
 ALLOWED = {"Conv", "Add", "Sub", "Mul", "Div", "Relu", "Erf", "Softmax", "Einsum", "Concat", "Split",
-           "Slice", "Transpose", "Reshape", "LayerNormalization", "ReduceMean", "Pow", "Pad", "Sqrt"}
+           "Slice", "Transpose", "Reshape", "LayerNormalization", "ReduceMean", "Pow", "Pad", "Sqrt",
+           "Exp", "Reciprocal"}
 
 
 def stage_name(S, st):

@@ -84,7 +84,7 @@ function renderStatus() {
   $("#assist-row").hidden = !(st.assist && st.assist.available);
   if (st.state === "ready") {
     dot.classList.add("ready");
-    name.textContent = prettyModel(st.model);
+    name.textContent = matchMedia("(max-width: 600px)").matches ? prettyModel(st.model).split(" · ")[0] : prettyModel(st.model);
     if (st.last_ms) ms.textContent = `${Math.round(st.last_ms)} ms`;
     banner.hidden = true;
   } else if (st.state === "loading") {

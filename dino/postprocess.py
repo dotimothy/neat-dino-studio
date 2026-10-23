@@ -17,29 +17,32 @@ def sigmoid(x):
     return 1.0 / (1.0 + np.exp(-np.clip(x, -60, 60)))
 
 
-def candidates(logits, boxes, pr: Prompt, lb: Letterbox, floor: float = 0.05, nms_iou: float | None = None):
+def candidates(logits, boxes, pr: Prompt, lb: Letterbox, floor: float = 0.05, nms_iou: float | None = None,
+               max_n: int = 300):
     """All queries scoring above `floor`, with per-phrase scores, so thresholds can move client-side.
 
     Returns a list of dicts sorted by score:
-      box [x0, y0, x1, y1] in source pixels, score, phrase (index), phrase_scores [P], token_probs [T]
+      box [x0, y0, x1, y1] in source pixels, score, phrase (index), phrase_scores [P]
     """
     prob = sigmoid(logits)
     prob[:, ~pr.token_mask] = 0
     score = prob.max(1)
     keep = np.nonzero(score > floor)[0]
-    keep = keep[np.argsort(-score[keep])]
-    xyxy = lb.boxes_to_source(boxes[keep])
+    keep = keep[np.argsort(-score[keep])][:max_n]
     nph = len(pr.phrases)
-    out = []
-    for j, q in enumerate(keep):
-        ps = np.zeros(nph, np.float32)
-        for p in range(nph):
-            m = pr.phrase_of_token == p
-            if m.any():
-                ps[p] = prob[q, m].max()
-        out.append({"box": [round(float(v), 1) for v in xyxy[j]], "score": round(float(score[q]), 4),
-                    "phrase": int(ps.argmax()) if nph else -1, "phrase_scores": [round(float(v), 4) for v in ps],
-                    "query": int(q)})
+    if nph:
+        sub = prob[keep]
+        ps = np.stack([sub[:, pr.phrase_of_token == p].max(1) if (pr.phrase_of_token == p).any()
+                       else np.zeros(len(keep), np.float32) for p in range(nph)], 1)
+        best = ps.argmax(1)
+    else:
+        ps = np.zeros((len(keep), 0), np.float32)
+        best = -np.ones(len(keep), int)
+    xyxy = np.round(lb.boxes_to_source(boxes[keep]), 1).tolist()
+    sc = np.round(score[keep], 4).tolist()
+    psr = np.round(ps, 4).tolist()
+    out = [{"box": xyxy[j], "score": sc[j], "phrase": int(best[j]), "phrase_scores": psr[j], "query": int(q)}
+           for j, q in enumerate(keep)]
     if nms_iou:
         out = nms(out, nms_iou)
     return out

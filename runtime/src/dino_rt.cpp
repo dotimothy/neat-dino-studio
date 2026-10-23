@@ -373,6 +373,7 @@ class Detector {
       auto tc = Clock::now();
       Buffer& pin = *dpre_in_[k % 2];
       sine_box(ref4.data(), qs.data());
+#pragma omp parallel for schedule(static)
       for (int q = 0; q < NQ; ++q) {
         to_bf16_span(qs.data() + (size_t)q * 512, pin.tok(NQ + q), kD);
         to_bf16_span(qs.data() + (size_t)q * 512 + kD, pin.tok(2 * NQ + q), kD);
