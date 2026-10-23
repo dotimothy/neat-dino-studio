@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 # Copy compiled probes to the DevKit, run them with pyneat, fetch outputs, compare.
 #   compile/probes/board_check.sh gs24 gs96
-#   BOARD=sima@192.168.91.225 REMOTE=/media/nvme/dino-dev/probes (defaults)
+#   BOARD=sima@<board-ip> (required), REMOTE=/media/nvme/dino-dev/probes (default)
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/../.." && pwd -P)"
-BOARD="${BOARD:-sima@192.168.91.225}"
+BOARD="${BOARD:?set BOARD=user@board-ip}"
 REMOTE="${REMOTE:-/media/nvme/dino-dev/probes}"
 P="$ROOT/build/probes"
 ssh "$BOARD" "mkdir -p $REMOTE"

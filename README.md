@@ -115,4 +115,6 @@ The microphone, like the webcam, needs the page over HTTPS.
 ## License
 
 Apache-2.0. Grounding DINO © IDEA Research (Apache-2.0); BERT and Swin weights as distributed
-with it. Inter and JetBrains Mono fonts under the SIL Open Font License.
+with it. Inter and JetBrains Mono fonts under the SIL Open Font License. The voice models
+(Whisper, Gemma, LFM) are not part of this repository; they are installed separately under
+their own licenses.

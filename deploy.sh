@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Developer deploy: copy this working tree (and locally built model bundles) to a DevKit.
-#   BOARD=sima@192.168.91.225 ./deploy.sh [--models] [--build]
+#   BOARD=sima@<board-ip> ./deploy.sh [--models] [--build]
 #     --models  also copy build/bundles/* into the board's models directory
 #     --build   build the runtime on the board afterwards
 # REMOTE (default /media/nvme/neat-dino-studio) is the install directory on the board.
