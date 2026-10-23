@@ -166,6 +166,8 @@ function showBanner(text, err = false, action = null) {
 
 function prettyModel(n) {
   if (!n) return "No Model";
+  const s3 = /sam3-(\d+)-(\w+)/.exec(n);
+  if (s3) return `SAM 3 · ${s3[1]} px · ${s3[2]}`;
   const t = /dino-tiny-(\d+)-(\w+)/.exec(n);
   if (t) return `Grounding DINO Tiny · ${t[1]} px · ${t[2]}`;
   const m = /dino-(\d+)-(\w+)/.exec(n);
@@ -461,6 +463,25 @@ function fitOverlay() {
   draw();
 }
 
+// A detection's mask (base64 of packed bits, M x M) as a canvas in its phrase color; cached on it.
+function maskCanvas(d, M, color) {
+  if (d._mc && d._mcColor === color) return d._mc;
+  const bits = Uint8Array.from(atob(d.mask), (c) => c.charCodeAt(0));
+  const c = document.createElement("canvas");
+  c.width = c.height = M;
+  const g = c.getContext("2d"), img = g.createImageData(M, M);
+  const r = parseInt(color.slice(1, 3), 16), gr = parseInt(color.slice(3, 5), 16), b = parseInt(color.slice(5, 7), 16);
+  for (let i = 0; i < M * M; i++) {
+    if (bits[i >> 3] & (0x80 >> (i & 7))) {
+      img.data[i * 4] = r; img.data[i * 4 + 1] = gr; img.data[i * 4 + 2] = b; img.data[i * 4 + 3] = 255;
+    }
+  }
+  g.putImageData(img, 0, 0);
+  d._mc = c;
+  d._mcColor = color;
+  return c;
+}
+
 function draw() {
   const cv = $("#overlay"), ctx = cv.getContext("2d");
   ctx.clearRect(0, 0, cv.width, cv.height);
@@ -475,6 +496,19 @@ function draw() {
   const fill = $("#fill-boxes").checked, scores = $("#show-scores").checked;
   ctx.font = `600 ${fs}px Inter, system-ui, sans-serif`;
   ctx.textBaseline = "top";
+  // SAM 3 masks: each covers the whole image (it was stretched to a square), drawn under the boxes
+  if (r.mask_size) {
+    ctx.save();
+    ctx.imageSmoothingEnabled = true;
+    if (mirror) { ctx.translate(cv.width, 0); ctx.scale(-1, 1); }
+    dets.forEach((d, i) => {
+      if (!d.mask) return;
+      const mc = maskCanvas(d, r.mask_size, r.phrases[d.phrase].color);
+      ctx.globalAlpha = i === S.hover ? 0.7 : 0.45;
+      ctx.drawImage(mc, 0, 0, cv.width, cv.height);
+    });
+    ctx.restore();
+  }
   dets.forEach((d, i) => {
     const color = r.phrases[d.phrase].color;
     let [x0, y0, x1, y1] = d.box;

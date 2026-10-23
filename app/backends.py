@@ -86,6 +86,62 @@ class RuntimeBackend(Backend):
             self.rt.close()
 
 
+class Sam3Backend(Backend):
+    """SAM 3 on the board (sam3_rt). One concept per pass: the first phrase runs the whole model,
+    further phrases rerun only the detector on the image features still on the board."""
+    name = "mla"
+    kind = "sam3"
+    MAX_PHRASES = 8
+
+    def __init__(self, binary, bundle, log=None, progress=None):
+        from dino.sam3_client import Sam3Runtime
+        with ACCELERATOR_LOCK:
+            self.rt = Sam3Runtime(binary, bundle, log=log, progress=progress)
+        self.size = self.rt.size
+        self.mask_size = self.rt.M
+        self._text = None
+
+    @staticmethod
+    def phrases(text: str, cap: bool = True) -> list[str]:
+        out = []
+        for p in text.replace("\n", " ").split("."):
+            p = " ".join(p.split()).strip(" ,;")
+            if p and p.lower() not in [o.lower() for o in out]:
+                out.append(p)
+        return out[: Sam3Backend.MAX_PHRASES] if cap else out
+
+    def build_prompt(self, text):
+        from types import SimpleNamespace
+        ph = self.phrases(text)
+        return SimpleNamespace(phrases=ph, caption=" . ".join(ph) + (" ." if ph else ""), n_tokens=len(ph),
+                               truncated=len(self.phrases(text, cap=False)) > self.MAX_PHRASES)
+
+    def set_prompt(self, pr) -> float:
+        return 0.0
+
+    def detect(self, rgb, vw=None, vh=None, same_image=False):
+        """Warm-up / simple use: the first phrase of the last prompt, or 'object'."""
+        return self.detect_phrases(None if same_image else rgb, ["object"])
+
+    def detect_phrases(self, rgb, phrases, mask_min=0.2):
+        """rgb (S, S, 3) uint8 for a new image, or None to reuse the last one.
+        Returns [(phrase, Sam3Result, text_ms)]."""
+        out = []
+        with ACCELERATOR_LOCK:
+            for i, ph in enumerate(phrases):
+                t_ms = 0.0
+                if ph != self._text:
+                    t_ms = self.rt.set_text(ph)
+                    self._text = ph
+                r = self.rt.detect(rgb, mask_min) if (i == 0 and rgb is not None) else self.rt.detect_cached(mask_min)
+                out.append((ph, r, t_ms))
+        return out
+
+    def close(self):
+        with ACCELERATOR_LOCK:
+            self.rt.close()
+
+
 class TorchBackend(Backend):
     """HF reference on a PC (CUDA when available). Same letterbox and prompt handling as the board."""
     name = "torch"

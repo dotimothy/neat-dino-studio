@@ -25,6 +25,12 @@ target_link_libraries(dino_rt PRIVATE SimaLMM::sima_lmm_runtime OpenMP::OpenMP_C
 target_compile_options(dino_rt PRIVATE ${DINO_FLAGS})
 install(TARGETS dino_rt RUNTIME DESTINATION bin)
 
+add_executable(sam3_rt src/sam3_rt.cpp)
+target_include_directories(sam3_rt PRIVATE include ${JSONCPP_INCLUDE_DIR})
+target_link_libraries(sam3_rt PRIVATE SimaLMM::sima_lmm_runtime OpenMP::OpenMP_CXX)
+target_compile_options(sam3_rt PRIVATE ${DINO_FLAGS})
+install(TARGETS sam3_rt RUNTIME DESTINATION bin)
+
 add_executable(msda_bench tests/msda_bench.cpp)
 target_include_directories(msda_bench PRIVATE include)
 target_link_libraries(msda_bench PRIVATE OpenMP::OpenMP_CXX)

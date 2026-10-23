@@ -92,6 +92,12 @@ def model_info(name: str | None, manifest: dict | None = None) -> dict | None:
         g = re.search(r"-(\d{3})-", name)
         size = int(g.group(1)) if g else None
     prec = m.get("precision") or (name.rsplit("-", 1)[-1] if "-" in name else "bf16")
+    if m.get("kind") == "sam3" or name.startswith("sam3"):
+        n = len(m.get("programs", []))
+        return {"name": name, "kind": "sam3", "size": size, "precision": prec, "upstream": "facebook/sam3",
+                "variant": "sam3", "title": f"SAM 3 · {size} px · {prec}", "short": f"SAM3 {size}",
+                "details": f"facebook/sam3 · SAM 3, 840 M parameters (Perception Encoder ViT + CLIP text) · "
+                           f"{size}×{size} input · {prec} · boxes and masks" + (f" · {n} ELFs" if n else "")}
     v = VARIANTS[variant_of(name, m)]
     if m.get("kind") == "text" or "text" in name:
         return {"name": name, "kind": "text", "title": f"{v['family']} · Text Encoder (BERT Base)",
@@ -176,7 +182,7 @@ def read_bundle(d: Path) -> dict | None:
         m = json.loads((d / "manifest.json").read_text())
     except (OSError, ValueError):
         return None
-    if m.get("kind") not in ("detector", "text"):
+    if m.get("kind") not in ("detector", "text", "sam3"):
         return None
     return m
 
@@ -250,7 +256,7 @@ class Hub:
                 if not (self.NAME.fullmatch(name) and re.fullmatch(r"[a-z0-9][a-z0-9_.-]{0,48}", e["path"])
                         and len(files) == 1 and self.FILE.fullmatch(files[0]["name"])
                         and isinstance(files[0]["bytes"], int) and re.fullmatch(r"[0-9a-f]{64}", files[0]["sha256"])
-                        and e.get("kind") in ("detector", "text")):
+                        and e.get("kind") in ("detector", "text", "sam3")):
                     raise ValueError(f"the entry for {name!r} is not one this app understands")
                 models[name] = e
             self._models, self._error = models, None
@@ -559,7 +565,7 @@ class Studio:
             local = local_bundles(self.models_dir)
             if self.args.backend == "mla":
                 m = local.get(name)
-                if m is None or m.get("kind") != "detector":
+                if m is None or m.get("kind") not in ("detector", "sam3"):
                     raise StudioError(f"{name} is not a detector on this board")
                 req = m.get("requires")
                 if req and req not in local:
@@ -612,10 +618,14 @@ class Studio:
             size = int(re.search(r"(\d{3})", name).group(1)) if re.search(r"\d{3}", name) else 576
             return backends.TorchBackend(size)
         m = read_bundle(self.models_dir / name)
-        text = self.models_dir / m.get("requires", "dino-text-t64-bf16")
 
         def progress(done, total, stage):
             self.progress = {"done": done, "total": total, "stage": stage}
+        if m.get("kind") == "sam3":
+            binary = Path(self.args.runtime).with_name("sam3_rt")
+            return backends.Sam3Backend(binary, self.models_dir / name, log=lambda s: log(f"  sam3_rt: {s}"),
+                                        progress=progress)
+        text = self.models_dir / m.get("requires", "dino-text-t64-bf16")
         return backends.RuntimeBackend(self.args.runtime, self.models_dir / name, text,
                                        log=lambda s: log(f"  dino_rt: {s}"), progress=progress)
 
@@ -677,9 +687,73 @@ class Studio:
                 return self.models_dir / n
         return None
 
+    def detect_sam3(self, image_bytes, text, image_id, nms):
+        """SAM 3: per phrase boxes, scores and masks (masks cover the whole stretched image)."""
+        import base64
+        from dino.letterbox import Squash
+        t0 = time.time()
+        same = image_bytes is None
+        b = self.backend
+        rgb = geo = None
+        if not same:
+            img = ImageOps.exif_transpose(Image.open(io.BytesIO(image_bytes))).convert("RGB")
+            geo = Squash(b.size, img.width, img.height)
+            rgb = np.asarray(img.resize((b.size, b.size), Image.BILINEAR), np.uint8)
+        dec_ms = (time.time() - t0) * 1e3
+        phrases = b.phrases(text)
+        if not phrases:
+            raise StudioError("Type at least one thing to find, e.g. “person . dog .”")
+        with self.lock:
+            if same:
+                if image_id is None or image_id != self.last_image:
+                    raise StudioError("The image is gone from the board; send it again")
+                geo = self._last_lb
+            res = b.detect_phrases(rgb, phrases)
+            if not same:
+                self.last_image = hashlib.sha1(image_bytes).hexdigest()[:16]
+                self._last_lb = geo
+            model, image_ref = self.model, self.last_image
+        t_post = time.time()
+        dets = []
+        P = len(phrases)
+        for p, (_, r, _) in enumerate(res):
+            sc = r.scores
+            keep = np.nonzero(sc > 0.05)[0]
+            xyxy = np.round(geo.boxes_to_source(r.boxes[keep]), 1).tolist()
+            for j, q in enumerate(keep):
+                d = {"box": xyxy[j], "score": round(float(sc[q]), 4), "phrase": p,
+                     "phrase_scores": [round(float(sc[q]), 4) if k == p else 0.0 for k in range(P)], "query": int(q)}
+                if int(q) in r.masks:
+                    d["mask"] = base64.b64encode(np.packbits(r.masks[int(q)].ravel())).decode()
+                dets.append(d)
+        dets.sort(key=lambda d: -d["score"])
+        if nms:
+            dets = postprocess.nms(dets, nms)
+        tm = [r.timing for _, r, _ in res]
+        timing = {"text": round(sum(t for _, _, t in res), 1),
+                  "encoder_mla": round(sum(t.get("encoder", 0) for t in tm), 1),
+                  "decoder_mla": round(sum(t.get("decoder_mla", 0) for t in tm), 1),
+                  "decoder_cpu": round(sum(t.get("decoder_cpu", 0) for t in tm), 1)}
+        if not same:
+            t = tm[0]
+            timing["backbone"] = round(t.get("vit", 0) + t.get("neck", 0), 1)
+            timing["backbone_cpu"] = round(t.get("patchify", 0) + t.get("to_image", 0), 1)
+            timing["decode"] = round(dec_ms, 1)
+        total = (time.time() - t0) * 1e3
+        timing["postprocess"] = round((time.time() - t_post) * 1e3, 1)
+        timing["server_total"] = round(total, 1)
+        self.last_ms = round(total, 1)
+        return {"model": model, "size": b.size, "image_id": image_ref, "width": geo.width, "height": geo.height,
+                "caption": " . ".join(phrases) + " .",
+                "phrases": [{"text": p, "color": PALETTE[i % len(PALETTE)]} for i, p in enumerate(phrases)],
+                "truncated": False, "tokens": len(phrases), "detections": dets[:300], "timing": timing,
+                "same_image": same, "mask_size": b.mask_size}
+
     def detect(self, image_bytes: bytes | None, text: str, image_id: str | None, nms: float | None) -> dict:
         """One detection. Decoding and post-processing run outside the lock, and the runtime
         takes the next frame while this one is still running, so Live mode keeps two in flight."""
+        if getattr(self.backend, "kind", "") == "sam3" and self.state == "ready":
+            return self.detect_sam3(image_bytes, text, image_id, nms)
         t0 = time.time()
         same = image_bytes is None
         dec_ms = 0.0

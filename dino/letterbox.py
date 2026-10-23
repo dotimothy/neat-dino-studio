@@ -36,6 +36,32 @@ class Letterbox:
         return out
 
 
+@dataclass
+class Squash:
+    """The whole image stretched to size x size (SAM 3's own preprocessing): box coordinates
+    and masks cover the full image, each axis scaled on its own."""
+    size: int
+    width: int
+    height: int
+
+    @property
+    def new_w(self) -> int:
+        return self.size
+
+    @property
+    def new_h(self) -> int:
+        return self.size
+
+    def boxes_to_source(self, boxes_cxcywh: np.ndarray) -> np.ndarray:
+        b = np.asarray(boxes_cxcywh, np.float32)
+        x0, y0 = b[..., 0] - b[..., 2] / 2, b[..., 1] - b[..., 3] / 2
+        x1, y1 = b[..., 0] + b[..., 2] / 2, b[..., 1] + b[..., 3] / 2
+        out = np.stack([x0 * self.width, y0 * self.height, x1 * self.width, y1 * self.height], -1)
+        out[..., 0::2] = out[..., 0::2].clip(0, self.width)
+        out[..., 1::2] = out[..., 1::2].clip(0, self.height)
+        return out
+
+
 def letterbox(img: Image.Image | np.ndarray, size: int) -> tuple[np.ndarray, Letterbox]:
     """Return the normalised (3, size, size) float32 image and its geometry."""
     if isinstance(img, np.ndarray):
