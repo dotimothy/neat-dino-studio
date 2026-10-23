@@ -73,12 +73,20 @@ tags: [sima-ai, modalix, mla, grounding-dino, open-vocabulary-detection, edge]
 
 ## How it runs
 
-The network is cut into MLA programs, all bf16: the text encoder; the Swin-B backbone as 27
-programs; 7 encoder and 13 decoder programs. Each is one MLA ELF. Between them the board's
-Arm cores do what the MLA cannot: multi-scale deformable-attention sampling, the top-900
-query selection, the reference-box updates, and moving Swin tokens between window layouts.
-The runtime (`dino_rt`) runs the ELFs with SimaLMM's `MLAModelWithBuffer` and reads and
-writes their bf16 buffers in place.
+The network is cut into 30 MLA programs, all bf16, one MLA ELF each: the text encoder (BERT +
+projection); the Swin-B backbone as 9 programs (whole stages, with the window shifts inside);
+7 encoder programs; decoder value maps and 12 decoder programs. Between them the board's Arm
+cores do what the MLA cannot: multi-scale deformable-attention sampling (NEON), the top-900
+query selection, the reference-box updates, and Swin patch merging. The runtime (`dino_rt`)
+runs the ELFs with SimaLMM's `MLAModelWithBuffer`, reads and writes their bf16 buffers in
+place, and keeps two frames in flight in Live mode.
+
+| Measured on a Modalix DevKit | Fast · 576 px | Accurate · 768 px |
+|---|---|---|
+| Per new image | 0.33 s | 0.54 s |
+| Live, two frames in flight | 3.9 FPS | 2.3 FPS |
+| COCO AP, 500-image val2017 subset (square letterbox) | 42.0 | 46.4 |
+| Same, FP32 PyTorch on GPU, same inputs | 41.7 | 45.8 |
 
 Use the bundles with the studio (Settings → Models downloads them) or `webapp/run.sh --fetch fast`.
 
