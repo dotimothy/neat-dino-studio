@@ -162,7 +162,8 @@ class Hub:
         self.quiet = False
 
     def url(self, path: str) -> str:
-        return f"https://huggingface.co/{self.repo}/resolve/main/{path}"
+        base = os.environ.get("DINO_HUB_URL")              # a stand-in server, for tests
+        return f"{base.rstrip('/')}/{path}" if base else f"https://huggingface.co/{self.repo}/resolve/main/{path}"
 
     def _refresh(self) -> None:
         try:
