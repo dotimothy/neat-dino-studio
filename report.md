@@ -10,9 +10,10 @@ sima-frontend 2.1.3), 2026-10-22/23.
 |---|---|---|
 | MLA programs (bf16, 1 ELF each) | 48 (+ text encoder, shared) | 48 (+ text encoder, shared) |
 | Per new image, board | **~0.36 s** | **~0.60 s** |
-| Prompt change on the same image | ~0.25 s | ~0.42 s |
+| COCO AP50 / APsmall, board | 65.5 / 18.4 | 69.8 / 26.3 |
+| Prompt change on the same image | ~0.25 s | ~0.41 s |
 | Prompt (text encoder) | 4.7 ms | 4.7 ms |
-| COCO AP, 500-image val2017 subset, board | **42.0** | (see below) |
+| COCO AP, 500-image val2017 subset, board | **42.0** | **46.4** |
 | Same, FP32 PyTorch on GPU, same letterbox | 41.7 | 45.8 |
 | Bundle on disk | 1.7 GB | 1.4 GB |
 

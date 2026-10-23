@@ -52,8 +52,14 @@ image tokens. So the network is cut into MLA programs, and the board's Arm cores
 their bf16 buffers in place, so there are no copies through the EV74 between stages. The web
 app (`webapp/server.py`) talks to it as a child process; unloading a model stops it cleanly.
 
-Accuracy: on the board, bf16 detections match the FP32 PyTorch model box for box (IoU ≥ 0.98
-on the top detections, scores within ±0.04). See `report.md` for numbers.
+| | Fast · 576 px | Accurate · 768 px |
+|---|---|---|
+| Per new image (board) | 0.36 s | 0.60 s |
+| Prompt change, same image | 0.25 s | 0.41 s |
+| COCO AP, board (500-image val subset) | 42.0 | 46.4 |
+| COCO AP, FP32 PyTorch, same inputs | 41.7 | 45.8 |
+
+The bf16 build on the MLA matches the FP32 model. See `report.md` for details.
 
 ## Build it yourself
 
