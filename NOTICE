@@ -20,3 +20,7 @@ resized and cropped for thumbnails. Sources:
   cows.jpg  COCO 000000402992  http://farm7.staticflickr.com/6135/5922506927_b60c053513_z.jpg
   bird.jpg  COCO 000000309452  http://farm6.staticflickr.com/5523/9556185989_32d49ca90f_z.jpg
   beach-horses.jpg  COCO 000000007281  http://farm5.staticflickr.com/4112/5022207571_74aab92fd5_z.jpg
+
+SAM 3 (facebook/sam3) weights, and bundles built from them by tools/make_sam3_bundle.py, are
+under the SAM License (Meta, November 19, 2025), included as LICENSE in each SAM 3 bundle. The
+code in this repository that exports, compiles and runs SAM 3 is Apache-2.0.

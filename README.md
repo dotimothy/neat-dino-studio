@@ -39,6 +39,8 @@ Type or say what to find — <code>person . red car . dog with a frisbee .</code
 - **Your camera and microphone.** Settings → Devices picks them, with a live preview and a level meter.
 - **Two sizes of Base, and Tiny.** *Fast* (576 px) for the webcam, *Accurate* (768 px) for small objects, both
   Grounding DINO Base. Grounding DINO **Tiny** (576 px) is also supported: a bit quicker and a smaller bundle. All bf16.
+- **SAM 3, with masks.** Meta's [SAM 3](https://ai.meta.com/research/sam3/) (Segment Anything with Concepts) runs as a third
+  model family: the same prompts, voice and Live mode, and every match gets a mask as well as a box (see below).
 
 ## Install (Modalix DevKit)
 
@@ -145,9 +147,34 @@ rules turn the request into phrases. The *Assist*
 button uses the same LLM on typed text. Voice stays on across restarts until turned off.
 The microphone, like the webcam, needs the page over HTTPS.
 
+## SAM 3 (segmentation masks)
+
+[facebook/sam3](https://huggingface.co/facebook/sam3), 840 M parameters (Perception Encoder ViT, CLIP text encoder,
+DETR-style detector, mask decoder), compiled for the MLA at 672 px (2×2 windows of the ViT's 336-px window) in bf16:
+21 ELFs, a 5.7 GB bundle, loaded from Settings → Models like the detectors. SAM 3 finds one concept per pass, so each
+phrase of the prompt is one pass; the image features stay on the board, so extra phrases and prompt changes rerun only
+the detector.
+
+| On a Modalix DevKit, 672 px | |
+|---|---|
+| New image, one phrase | ~0.9 s (ViT 0.77 s) |
+| Each further phrase / prompt change | ~0.1 s |
+| vs PyTorch (FP32) on test images | same detections, scores within 0.004, box IoU ≥ 0.97, mask IoU ≥ 0.99 |
+
+On the MLA: the ViT (4 groups of 7 windowed layers, 4 global layers; rotary positions folded into the weights, tokens
+kept in window order), the FPN neck, the CLIP text encoder, the DETR encoder, the 6 decoder layers with their query
+position, box relative-position bias and box head, the mask decoder's prompt attention and pixel decoder. On the CPU
+(`runtime/src/sam3_rt.cpp`): patching, window to image order, the boxes' sine embedding and edge distances, the box
+update, presence and text scoring, and query · pixel for the masks that are kept.
+
+Build: `.venv-sam3` with transformers 5 (SAM 3's weights are gated: accept the license on Hugging Face first), then
+`model/sam3_export.py --size 672`, `compile/build_sam3.sh 672`, `tools/make_sam3_bundle.py --size 672`, and
+`tools/sam3_e2e.py` to check the board against PyTorch. The SAM 3 bundle is not on Hugging Face yet.
+
 ## License
 
 Apache-2.0. Grounding DINO © IDEA Research (Apache-2.0); BERT and Swin weights as distributed
 with it. Inter and JetBrains Mono fonts under the SIL Open Font License. The voice models
 (Whisper, Gemma, LFM) are not part of this repository; they are installed separately under
-their own licenses.
+their own licenses. SAM 3's weights are under Meta's SAM License (https://github.com/facebookresearch/sam3/blob/main/LICENSE),
+not Apache-2.0; a SAM 3 bundle carries a copy of it.
