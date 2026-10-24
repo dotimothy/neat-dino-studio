@@ -38,3 +38,15 @@ def test_nms_per_phrase():
     d = [{"box": [0, 0, 10, 10], "phrase": 0, "score": .9}, {"box": [1, 1, 10, 10], "phrase": 0, "score": .8},
          {"box": [1, 1, 10, 10], "phrase": 1, "score": .7}]
     assert len(PP.nms(d, 0.5)) == 2
+
+
+def test_nms_np_matches_nms():
+    import numpy as np
+    from dino import postprocess as PP
+    rng = np.random.default_rng(0)
+    xy = rng.uniform(0, 500, (200, 2))
+    b = np.concatenate([xy, xy + rng.uniform(20, 200, (200, 2))], 1)
+    s, lab = rng.uniform(0, 1, 200), rng.integers(0, 3, 200)
+    keep = PP.nms_np(b, s, lab, 0.5)
+    ref = PP.nms([{"box": list(b[i]), "score": s[i], "phrase": int(lab[i])} for i in np.argsort(-s)], 0.5)
+    assert [round(d["score"], 9) for d in ref] == [round(float(s[i]), 9) for i in keep]

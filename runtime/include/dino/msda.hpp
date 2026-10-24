@@ -37,6 +37,7 @@ struct MsdaArgs {
   const float* ref = nullptr;        // encoder: [Q][2] (x, y); decoder: [Q][4] (cx, cy, w, h)
   int ref_dims = 2;
   int queries = 0;
+  int n_levels = kLevels;            // OmDet-Turbo: 3
   Level levels[kLevels];
 };
 
@@ -59,19 +60,20 @@ inline void axpy32(float* acc, const uint16_t* v, float w) {
 
 // One (query, head): softmax of the 16 logits, then 16 bilinear samples.
 inline void sample_head(const MsdaArgs& a, int q, int h, float* acc) {
-  const uint16_t* lg = a.logits + (size_t)q * kD + h * kLevels * kPoints;
-  const uint16_t* of = a.offsets + (size_t)q * kD + h * kLevels * kPoints * 2;
+  const int L = a.n_levels, LP = L * kPoints;
+  const uint16_t* lg = a.logits + (size_t)q * kD + h * LP;
+  const uint16_t* of = a.offsets + (size_t)q * kD + h * LP * 2;
   float w[kLevels * kPoints], m = -INFINITY;
-  for (int i = 0; i < kLevels * kPoints; ++i) {
+  for (int i = 0; i < LP; ++i) {
     w[i] = from_bf16(lg[i]);
     m = w[i] > m ? w[i] : m;
   }
   float sum = 0;
-  for (int i = 0; i < kLevels * kPoints; ++i) sum += (w[i] = std::exp(w[i] - m));
+  for (int i = 0; i < LP; ++i) sum += (w[i] = std::exp(w[i] - m));
   const float inv = 1.0f / sum;
   const float* r = a.ref + (size_t)q * a.ref_dims;
   for (int d = 0; d < kHeadDim; ++d) acc[d] = 0;
-  for (int l = 0; l < kLevels; ++l) {
+  for (int l = 0; l < L; ++l) {
     const Level& lv = a.levels[l];
     const float W = (float)lv.w, H = (float)lv.h;
     const uint16_t* base = a.value + lv.start * kD + h * kHeadDim;

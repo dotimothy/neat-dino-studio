@@ -34,6 +34,7 @@
   <symbol id="i-search" viewBox="0 0 24 24"><circle cx="11" cy="11" r="6.5"/><path d="m16 16 4 4"/></symbol>
   <symbol id="i-chip" viewBox="0 0 24 24"><rect x="7" y="7" width="10" height="10" rx="1.5"/><path d="M10 3v3M14 3v3M10 18v3M14 18v3M3 10h3M3 14h3M18 10h3M18 14h3"/></symbol>
   <symbol id="i-download" viewBox="0 0 24 24"><path d="M12 4v11M7.5 10.5 12 15l4.5-4.5M5 19.5h14"/></symbol>
+  <symbol id="i-info" viewBox="0 0 24 24"><circle cx="12" cy="12" r="8.5"/><path d="M12 11v5.5M12 7.6v.1"/></symbol>
   <symbol id="i-trash" viewBox="0 0 24 24"><path d="M5 7h14M10 7V5h4v2M7 7l1 12.5h8L17 7"/></symbol>
   <symbol id="i-check" viewBox="0 0 24 24"><path d="m5 12.5 4.5 4.5L19 7.5"/></symbol>
   <symbol id="i-shield" viewBox="0 0 24 24"><path d="M12 3.5 5 6v5.5c0 4.2 3 7.6 7 9 4-1.4 7-4.8 7-9V6z"/><path d="m9 12 2.2 2.2L15.5 10"/></symbol>
@@ -181,6 +182,7 @@
     <nav class="modal-nav">
       <div class="modal-title">Settings</div>
       <button class="nav-item active" data-pane="models"><svg><use href="#i-chip"/></svg>Models</button>
+      <button class="nav-item" data-pane="hub"><svg><use href="#i-download"/></svg>Add Model</button>
       <button class="nav-item" data-pane="voice"><svg><use href="#i-mic"/></svg>Voice</button>
       <button class="nav-item" data-pane="devices"><svg><use href="#i-webcam"/></svg>Devices</button>
       <button class="nav-item" data-pane="display"><svg><use href="#i-image"/></svg>Display</button>
@@ -191,17 +193,64 @@
 
       <section class="pane" data-pane="models">
         <h3>Models</h3>
-        <p class="muted">One detector runs on the MLA at a time. A detector needs the text encoder too; downloads include it.
-          Fast (576 px) suits the webcam; Accurate (768 px) finds smaller things. Tiny is the smaller Grounding DINO
-          (Swin-T backbone, 172.2 M parameters): quicker, a little less accurate. EfficientSAM (Ti or S) loads next to a
-          Grounding DINO detector and turns its boxes into masks (Show Masks, under Thresholds).</p>
-        <div class="storage" id="storage"></div>
-        <div class="model-list" id="model-list"></div>
-        <div class="hub-line" id="hub-line"></div>
+        <p class="muted">One detector runs on the MLA at a time; EfficientSAM loads next to a Grounding DINO or OmDet detector
+          when Show Masks is on. Get more from the Add Model tab.</p>
+        <div class="model-search-row">
+          <input type="search" id="model-search" class="setting-input" placeholder="Search Your Downloaded Models…" autocomplete="off">
+          <button class="icon-button" id="model-rescan" type="button" title="Rescan Downloaded Models"><svg><use href="#i-refresh"/></svg></button>
+        </div>
+        <div class="model-filters">
+          <select id="model-filter-type" class="setting-select" title="Model Type">
+            <option value="">All Types</option><option value="detector">Detectors</option>
+            <option value="masks">Mask Models</option><option value="text">Text Encoders</option>
+          </select>
+          <select id="model-filter-family" class="setting-select" title="Model Family"><option value="">All Families</option></select>
+          <select id="model-sort" class="setting-select" title="Sort By">
+            <option value="loaded">Loaded First</option><option value="name">Name (A–Z)</option>
+            <option value="size-desc">Largest</option><option value="size-asc">Smallest</option>
+          </select>
+        </div>
+        <div class="model-load-progress" id="model-load-progress">
+          <div class="model-load-progress-label">Load Status</div>
+          <div class="model-load-bar" id="model-load-bar" hidden><div class="model-load-fill"></div></div>
+          <div class="model-status" id="model-status"></div>
+        </div>
+        <div class="model-list-group">
+          <div class="model-list-head"><span class="model-list-title">Downloaded — On This Board</span><span class="model-list-count" id="model-count"></span></div>
+          <div class="model-list" id="model-list"></div>
+        </div>
+        <div class="model-disk" id="storage"></div>
         <div class="danger">
-          <div><b>Reset MLA</b><div class="muted small">Unloads the model and restarts the accelerator runtime. Use it when a load keeps failing.</div></div>
+          <div><b>Reset MLA</b><div class="muted small">Unloads the models and restarts the accelerator runtime. Use it when a load keeps failing.</div></div>
           <button class="btn danger-btn" id="reset-mla"><svg><use href="#i-refresh"/></svg>Reset MLA</button>
         </div>
+      </section>
+
+      <section class="pane" data-pane="hub" hidden>
+        <h3>Add Model</h3>
+        <p class="muted">Download compiled models from Hugging Face onto this board. Each Grounding DINO detector brings its
+          text encoder along.</p>
+        <div class="model-search-row">
+          <input type="search" id="hub-search" class="setting-input" placeholder="Search Models To Download…" autocomplete="off">
+          <button class="icon-button" id="hub-refresh" type="button" title="Refresh The Hugging Face List"><svg><use href="#i-refresh"/></svg></button>
+        </div>
+        <div class="model-filters">
+          <select id="hub-filter-type" class="setting-select" title="Model Type">
+            <option value="">All Types</option><option value="detector">Detectors</option>
+            <option value="masks">Mask Models</option><option value="text">Text Encoders</option>
+          </select>
+          <select id="hub-filter-family" class="setting-select" title="Model Family"><option value="">All Families</option></select>
+          <select id="hub-sort" class="setting-select" title="Sort By">
+            <option value="name">Name (A–Z)</option><option value="size-desc">Largest</option><option value="size-asc">Smallest</option>
+          </select>
+          <span class="hub-count" id="hub-count"></span>
+        </div>
+        <div class="model-disk" id="hub-storage"></div>
+        <div class="model-list-group">
+          <div class="model-list-head"><span class="model-list-title">Available To Download — From Hugging Face</span></div>
+          <div class="model-list" id="hub-list"></div>
+        </div>
+        <div class="hub-line" id="hub-line"></div>
       </section>
 
       <section class="pane" data-pane="voice" hidden>

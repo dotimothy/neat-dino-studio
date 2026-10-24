@@ -115,3 +115,30 @@ def test_masks_toggle_and_detect(client):
     d3 = client.post("/api/detect", data={"prompt": "bird .", "image_id": d["image_id"]}).get_json()
     assert "mask_size" not in d3
     assert client.post("/api/masks", json={"model": None}).get_json()["state"] == "off"
+
+
+def test_masks_follow_the_detector(client):
+    def masks():
+        for _ in range(100):
+            m = client.get("/api/status").get_json()["masks"]
+            if m["state"] not in ("loading", "unloading"):
+                return m
+            time.sleep(0.05)
+        return m
+    name = client.get("/api/status").get_json()["masks"]["choices"][0]["name"]
+    # no detector yet: the choice is remembered, nothing loads
+    assert client.post("/api/masks", json={"model": name}).status_code == 200
+    m = masks()
+    assert m["state"] == "off" and m["wanted"] == name
+    # the detector loads -> the mask model follows
+    client.post("/api/models/load", json={"name": "dino-576-bf16"})
+    wait_ready(client)
+    m = masks()
+    assert m["state"] == "ready" and m["model"] == name
+    # the detector unloads -> so do the masks; the choice stays
+    client.post("/api/models/unload", json={"wait": True})
+    m = masks()
+    assert m["state"] == "off" and m["wanted"] == name
+    # turning masks off forgets it
+    client.post("/api/masks", json={"model": None})
+    assert masks()["wanted"] is None
