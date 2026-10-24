@@ -29,3 +29,8 @@ EfficientSAM (yformer/EfficientSAM): the model code in third_party/efficient_sam
 EfficientSAM-Ti / -S weights used by the esam-* bundles, Copyright Meta Platforms, Inc. and
 affiliates, licensed under the Apache License 2.0 (third_party/efficient_sam/LICENSE, also
 included as LICENSE in each EfficientSAM bundle).
+
+OmDet-Turbo (omlab/omdet-turbo-swin-tiny-hf, om-ai-lab/OmDet): the weights used by the
+omdet-turbo-* bundles, Copyright Om AI Lab, licensed under the Apache License 2.0. The
+model code in model/omdet_mla.py follows transformers' modeling_omdet_turbo.py and timm's
+Swin Transformer (Apache License 2.0).

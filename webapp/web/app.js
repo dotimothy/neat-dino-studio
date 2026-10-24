@@ -120,6 +120,7 @@ function renderStatus() {
     (st.load_seconds ? `, loaded in ${st.load_seconds} s` : "");
   renderVoice();
   renderMasks();
+  if ($("#settings").open && S.catalog) renderLoadStatus();
 }
 
 // --------------------------------------------------------------------- masks (EfficientSAM next to the detector)
@@ -240,6 +241,8 @@ function showBanner(text, err = false, action = null) {
 
 function prettyModel(n) {
   if (!n) return "No Model";
+  const om = /omdet-turbo-(\d+)-(\w+)/.exec(n);
+  if (om) return `OmDet-Turbo Tiny · ${om[1]} px · ${om[2]}`;
   const es = /esam-(ti|s)(\d+)-(\w+)/.exec(n);
   if (es) return `EfficientSAM ${es[1] === "ti" ? "Ti" : "S"} · ${es[2]} px · ${es[3]}`;
   const s3 = /sam3-(\d+)-(\w+)/.exec(n);
@@ -1130,7 +1133,7 @@ function openSettings(pane = "models") {
   $$(".pane").forEach((p) => (p.hidden = p.dataset.pane !== pane));
   const d = $("#settings");
   if (!d.open) d.showModal();
-  if (pane === "models") refreshModels();
+  if (pane === "models" || pane === "hub") refreshModels();
   if (pane === "devices") renderDevices();
   else stopDevicePreview();
 }
@@ -1261,107 +1264,246 @@ async function refreshModels() {
   try {
     cat = await api("/api/models");
   } catch (e) {
-    $("#model-list").textContent = e.message;
+    $("#model-status").textContent = e.message;
     return;
   }
-  renderModels(cat);
+  S.catalog = cat;
   await refreshStatus();
-  const busy = cat.models.some((m) => m.state === "downloading") ||
-    (S.status && (S.status.state === "loading" || S.status.state === "unloading"));
+  renderModels();
+  const st = S.status || {}, mk = st.masks || {};
+  const busy = cat.models.some((m) => m.state === "downloading") || ["loading", "unloading"].includes(st.state) ||
+    ["loading", "unloading"].includes(mk.state);
   refreshModels.t = setTimeout(refreshModels, busy ? 900 : 5000);
 }
 
-function renderModels(cat) {
-  const used = cat.used_bytes || 0, free = cat.free_bytes || 0;
-  $("#storage").innerHTML = `<div class="bar"><span style="width:${Math.min(100, (100 * used) / Math.max(1, used + free)).toFixed(1)}%"></span></div>
-    <div class="txt"><span>Models use ${fmtBytes(used)} in ${cat.directory}</span><span>${fmtBytes(free)} free</span></div>`;
-  const list = $("#model-list");
-  list.innerHTML = "";
-  if (!cat.models.length) list.innerHTML = '<div class="muted">No models yet. The list from Hugging Face appears here once the board is online.</div>';
-  for (const m of cat.models) list.append(modelRow(m));
-  const hub = cat.hub;
-  $("#hub-line").innerHTML = hub.repo ? `Models come from <a href="${hub.page}" target="_blank" rel="noopener">${hub.repo}</a> on Hugging Face.` +
-    (hub.error ? ` <span style="color:var(--err)">${hub.error}</span>` : "") : "";
+// ---- Models / Add Model panes (laid out like NEAT GenAI Studio's model manager)
+const escHtml = (t) => String(t ?? "").replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+const modelType = (m) => (m.kind === "esam" ? "masks" : m.kind === "text" ? "text" : "detector");
+const TYPE_LABEL = { detector: "Detector", masks: "Masks", text: "Text Encoder" };
+function modelFamily(m) {
+  if (m.kind === "sam3") return "SAM 3";
+  if (m.kind === "omdet") return "OmDet-Turbo";
+  if (m.kind === "esam") return "EfficientSAM";
+  return m.variant === "tiny" ? "Grounding DINO Tiny" : "Grounding DINO Base";
 }
 
-function modelRow(m) {
-  const el = document.createElement("div");
-  el.className = "model" + (m.loaded ? " loaded" : "");
-  const st = S.status || {};
-  const busyHere = m.kind === "esam" ? !!m.loading : st.model === m.name && (st.state === "loading" || st.state === "unloading");
-  const tags = [];
-  if (busyHere) tags.push(`<span class="tag live">${st.state === "loading" ? "Loading" : "Unloading"}</span>`);
-  else if (m.loaded) tags.push('<span class="tag live">Loaded</span>');
-  if (m.state === "on_board") tags.push('<span class="tag on">On Board</span>');
-  if (m.verified === true) tags.push('<span class="tag on">Verified</span>');
-  if (m.verified === false) tags.push('<span class="tag" style="color:var(--err)">Damaged</span>');
-  el.innerHTML = `<div class="name"></div><div class="meta"></div><div class="actions"></div>`;
-  el.querySelector(".name").innerHTML = `<span></span>${tags.join("")}`;
-  el.querySelector(".name span").textContent = m.title;
-  const meta = [m.details, fmtBytes(m.bytes)];
-  if (m.kind === "text") meta.push(m.variant === "tiny" ? "used by the Tiny detector" : "used by every Base detector");
-  if (m.kind === "esam") meta.push("runs next to a Grounding DINO detector");
-  if (m.latency_ms) meta.push(`~${Math.round(m.latency_ms)} ms per image`);
-  if (m.kind === "detector" && m.requires && !m.requires_present) meta.push("needs the text encoder");
-  el.querySelector(".meta").textContent = meta.filter(Boolean).join(" · ") + (m.about ? ` — ${m.about}` : "");
-  const act = el.querySelector(".actions");
-  const btn = (label, icon, fn, cls = "") => {
-    const b = document.createElement("button");
-    b.className = "btn " + cls;
-    b.innerHTML = `<svg><use href="#i-${icon}"/></svg>${label}`;
-    b.onclick = fn;
-    act.append(b);
-    return b;
-  };
-  if (busyHere) {
-    const p = st.progress || {};
-    const b = document.createElement("button");
-    b.className = "btn";
-    b.disabled = true;
-    b.innerHTML = `<span class="spinner"></span>${st.state === "loading" ? "Loading…" : "Unloading…"}`;
-    act.append(b);
-    const pr = document.createElement("div");
-    pr.className = "prog";
-    pr.innerHTML = `<div class="pbar"><span></span></div><div class="txt"></div>`;
-    setBar(pr.querySelector(".pbar"), p.fraction);
-    pr.querySelector(".txt").textContent = [p.label, p.detail].filter(Boolean).join(" · ");
-    el.append(pr);
-  } else if (m.state === "downloading") {
-    btn("Cancel", "close", () => modelAction("cancel", m.name));
-  } else if (m.state === "available") {
-    btn(m.partial_bytes ? "Resume" : "Download", "download", () => modelAction("download", m.name), "primary");
-    if (m.partial_bytes) btn("Discard", "trash", () => modelAction("discard", m.name));
-  } else if (m.state === "on_board") {
-    if (m.kind === "detector" || m.kind === "sam3") {
-      if (m.loaded) btn("Unload", "stop", () => modelAction("unload", m.name));
-      else btn("Load", "chip", () => modelAction("load", m.name), "primary");
-    } else if (m.kind === "esam") {
-      if (m.loaded) btn("Unload", "stop", () => setMasks(null));
-      else btn("Load", "chip", () => setMasks(m.name), "primary");
+function fillFamilies(sel, models) {
+  const fams = [...new Set(models.map(modelFamily))].sort();
+  const key = fams.join("|");
+  if (sel.dataset.k === key) return;
+  const cur = sel.value;
+  sel.innerHTML = '<option value="">All Families</option>' + fams.map((f) => `<option value="${escHtml(f)}">${escHtml(f)}</option>`).join("");
+  sel.dataset.k = key;
+  if (fams.includes(cur)) sel.value = cur;
+}
+
+function filterSort(models, q, type, fam, sort) {
+  q = q.trim().toLowerCase();
+  const out = models.filter((m) => (!q || `${m.title} ${m.name} ${m.details} ${modelFamily(m)}`.toLowerCase().includes(q)) &&
+    (!type || modelType(m) === type) && (!fam || modelFamily(m) === fam));
+  const size = (m) => m.bytes || m.download_bytes || 0;
+  out.sort((a, b) => {
+    switch (sort) {
+      case "name": return a.title.localeCompare(b.title);
+      case "size-desc": return size(b) - size(a);
+      case "size-asc": return size(a) - size(b);
+      default: return (b.loaded ? 1 : 0) - (a.loaded ? 1 : 0) || modelType(a).localeCompare(modelType(b)) || a.title.localeCompare(b.title);
     }
-    btn("Verify", "shield", () => modelAction("verify", m.name));
-    if (m.on_hub) btn("Re-download", "refresh", () => modelAction("redownload", m.name));
-    btn("Delete", "trash", async () => {
-      if (await confirmBox(`Delete ${m.title} from the board? You can download it again later.`, "Delete")) modelAction("delete", m.name);
-    });
+  });
+  return out;
+}
+
+function renderModels() {
+  const cat = S.catalog;
+  if (!cat) return;
+  const free = cat.free_bytes || 0;
+  const disk = `NVMe Storage: ${fmtBytes(free)} free · models use ${fmtBytes(cat.used_bytes || 0)} in ${cat.directory}`;
+  $("#storage").textContent = disk;
+  $("#hub-storage").textContent = `NVMe Storage: ${fmtBytes(free)} free`;
+  renderLoadStatus();
+  // Models: what is on this board
+  const local = cat.models.filter((m) => m.state === "on_board");
+  fillFamilies($("#model-filter-family"), local);
+  const shown = filterSort(local, $("#model-search").value, $("#model-filter-type").value, $("#model-filter-family").value, $("#model-sort").value);
+  $("#model-count").textContent = local.length ? `${shown.length} of ${local.length}` : "";
+  const list = $("#model-list");
+  list.innerHTML = "";
+  if (!local.length) list.innerHTML = '<div class="hub-note">Nothing downloaded yet — get a model from the Add Model tab.</div>';
+  else if (!shown.length) list.innerHTML = '<div class="hub-note">No downloaded models match the search.</div>';
+  for (const m of shown) list.append(installedRow(m));
+  // Add Model: what Hugging Face has
+  const hub = cat.models.filter((m) => m.on_hub || m.state === "downloading");
+  fillFamilies($("#hub-filter-family"), hub);
+  const hshown = filterSort(hub, $("#hub-search").value, $("#hub-filter-type").value, $("#hub-filter-family").value, $("#hub-sort").value);
+  $("#hub-count").textContent = hub.length ? `${hshown.length} of ${hub.length}` : "";
+  const hl = $("#hub-list");
+  hl.innerHTML = "";
+  if (!hub.length) hl.innerHTML = `<div class="hub-note${cat.hub.error ? " error" : ""}">${escHtml(cat.hub.error ||
+    (cat.hub.listed ? "Hugging Face lists no models." : "Reading the model list from Hugging Face…"))}</div>`;
+  else if (!hshown.length) hl.innerHTML = '<div class="hub-note">No models match the search.</div>';
+  for (const m of hshown) hl.append(hubRow(m));
+  const h = cat.hub;
+  $("#hub-line").innerHTML = h.repo ? `Models come from <a href="${h.page}" target="_blank" rel="noopener">${escHtml(h.repo)}</a> on Hugging Face.` +
+    (h.error && hub.length ? ` <span style="color:var(--err)">${escHtml(h.error)}</span>` : "") : "";
+}
+
+// The detector's or the mask model's load / unload, right under the search.
+function renderLoadStatus() {
+  const st = S.status || {}, mk = st.masks || {};
+  const bar = $("#model-load-bar"), fill = bar.querySelector(".model-load-fill"), el = $("#model-status");
+  el.className = "model-status";
+  let busy = false;
+  if (st.state === "loading" || st.state === "unloading") {
+    busy = true;
+    const p = st.progress || {};
+    const what = st.model_info ? st.model_info.title : "the model";
+    el.textContent = `${st.state === "loading" ? "Loading" : "Unloading"} ${what}${p.label ? " — " + p.label : ""}${p.detail ? " · " + p.detail : ""}`;
+    fill.classList.toggle("indeterminate", p.fraction == null);
+    fill.style.width = p.fraction == null ? "" : `${Math.max(2, p.fraction * 100).toFixed(1)}%`;
+  } else if (mk.state === "loading" || mk.state === "unloading") {
+    busy = true;
+    el.textContent = `${mk.state === "loading" ? "Loading" : "Unloading"} ${mk.info ? mk.info.title : "the mask model"}…`;
+    fill.classList.add("indeterminate");
+  } else if (st.state === "error" || mk.state === "error") {
+    el.classList.add("error");
+    el.textContent = st.state === "error" ? st.error : mk.error;
+  } else if (st.state === "ready") {
+    el.classList.add("ready");
+    el.textContent = `Ready: ${st.model_info.title}` + (st.load_seconds ? ` · loaded in ${st.load_seconds} s` : "") +
+      (mk.state === "ready" && mk.info ? ` · masks: ${mk.info.short}` : "");
+  } else {
+    el.textContent = "No model loaded. Press Load on a model below.";
   }
+  if (busy) el.classList.add("loading");
+  bar.hidden = !busy;
+  $("#model-load-progress").classList.toggle("is-busy", busy);
+}
+
+function rowShell(m, badges) {
+  const row = document.createElement("div");
+  row.className = "hub-result model-row" + (m.loaded ? " is-active" : "");
+  row.innerHTML = `<div class="hub-result-meta"><span class="model-title"></span><span class="hub-repo"></span>
+    <span class="hub-badges">${badges.join("")}</span></div>`;
+  row.querySelector(".model-title").textContent = m.title;
+  row.querySelector(".hub-repo").textContent = m.name;
+  return row;
+}
+
+function rowButton(row, label, cls, fn, title = "") {
+  const b = document.createElement("button");
+  b.type = "button";
+  b.className = cls;
+  const icon = { "ℹ": "i-info", "🗑": "i-trash" }[label];
+  if (icon) b.innerHTML = `<svg><use href="#${icon}"/></svg>`;
+  else b.textContent = label;
+  if (title) b.title = title;
+  b.onclick = (e) => { e.stopPropagation(); fn(); };
+  row.append(b);
+  return b;
+}
+
+function moreBox(row, m, extra) {
+  const more = document.createElement("div");
+  more.className = "model-more";
+  more.hidden = !S.openInfo?.has(m.name);
+  const lines = [m.details, m.about, m.requires ? `Needs ${m.requires}${m.requires_present ? "" : " (not downloaded)"}` : "",
+    m.kind === "esam" ? "Loads next to a Grounding DINO or OmDet detector when Show Masks is on." : "",
+    m.verify_note && m.verified === false ? m.verify_note : ""].filter(Boolean);
+  more.innerHTML = lines.map((t) => `<div>${escHtml(t)}</div>`).join("") + '<div class="model-more-actions"></div>';
+  const act = more.querySelector(".model-more-actions");
+  for (const [label, fn] of extra) rowButton(act, label, "setting-button", fn);
+  row.append(more);
+  return more;
+}
+
+function toggleInfo(name, more) {
+  S.openInfo = S.openInfo || new Set();
+  if (S.openInfo.has(name)) S.openInfo.delete(name);
+  else S.openInfo.add(name);
+  more.hidden = !S.openInfo.has(name);
+}
+
+function installedRow(m) {
+  const st = S.status || {}, mk = st.masks || {};
+  const loading = m.kind === "esam" ? mk.model === m.name && mk.state === "loading" : st.model === m.name && st.state === "loading";
+  const unloading = m.kind === "esam" ? false : st.model === m.name && st.state === "unloading";
+  const stateTxt = m.verified === false ? "⚠ damaged" : loading ? "◌ loading" : unloading ? "◌ unloading" : m.loaded ? "● loaded" : "○ downloaded";
+  const stateCls = m.verified === false ? "is-incomplete" : m.loaded || loading ? "is-loaded" : "";
+  const type = modelType(m);
+  const badges = [`<span class="hub-badge hub-badge-${type}">${TYPE_LABEL[type]}</span>`,
+    `<span class="hub-badge hub-badge-fam">${escHtml(modelFamily(m))}</span>`,
+    m.bytes ? `<span class="hub-badge hub-badge-size">${fmtBytes(m.bytes)}</span>` : "",
+    `<span class="hub-badge model-state ${stateCls}">${stateTxt}</span>`,
+    m.verified === true ? '<span class="hub-badge hub-badge-ok">✓ verified</span>' : ""];
+  const row = rowShell(m, badges);
+  const extra = [["Verify Files", () => modelAction("verify", m.name)]];
+  if (m.on_hub) extra.push(["Re-download", () => modelAction("redownload", m.name)]);
+  const info = rowButton(row, "ℹ", "hub-info", () => toggleInfo(m.name, more), `Details for ${m.title}`);
+  const del = rowButton(row, "🗑", "hub-info hub-danger", async () => {
+    if (await confirmBox(`Delete ${m.title} from the board? You can download it again later.`, "Delete")) modelAction("delete", m.name);
+  }, `Delete ${m.title} from the board`);
+  del.disabled = m.loaded || loading;
+  let btn;
+  if (loading || unloading) {
+    btn = rowButton(row, loading ? "Loading…" : "Unloading…", "setting-button model-action", () => {});
+    btn.disabled = true;
+  } else if (m.kind === "text") {
+    btn = rowButton(row, "Used By Detectors", "setting-button model-action", () => {});
+    btn.disabled = true;
+    btn.title = "The text encoder loads with its Grounding DINO detector.";
+  } else if (m.loaded) {
+    btn = rowButton(row, "Unload", "setting-button model-action model-unload", () => (m.kind === "esam" ? setMasks(null) : modelAction("unload", m.name)));
+  } else {
+    btn = rowButton(row, "Load", "setting-button model-action model-load", () => (m.kind === "esam" ? setMasks(m.name) : modelAction("load", m.name)));
+    if (m.kind === "detector" && m.requires && !m.requires_present) {
+      btn.disabled = true;
+      btn.title = `Needs ${m.requires}; download it from Add Model`;
+    }
+    if (m.kind === "esam" && !(st.state === "ready" && st.model_info && st.model_info.kind !== "sam3"))
+      btn.title = "Turns masks on; it loads once a Grounding DINO or OmDet detector is loaded";
+  }
+  const more = moreBox(row, m, extra);
+  void info;
+  return row;
+}
+
+function hubRow(m) {
+  const type = modelType(m);
+  const onBoard = m.state === "on_board";
+  const size = m.download_bytes || m.bytes;
+  const badges = [`<span class="hub-badge hub-badge-${type}">${TYPE_LABEL[type]}</span>`,
+    `<span class="hub-badge hub-badge-fam">${escHtml(modelFamily(m))}</span>`,
+    size ? `<span class="hub-badge hub-badge-size">${fmtBytes(size)}</span>` : "",
+    onBoard ? '<span class="hub-badge model-state is-loaded">✓ on board</span>' : "",
+    m.partial_bytes && !onBoard && m.state !== "downloading" ? `<span class="hub-badge hub-badge-warn">${fmtBytes(m.partial_bytes)} partial</span>` : ""];
+  const row = rowShell({ ...m, loaded: false }, badges);
+  rowButton(row, "ℹ", "hub-info", () => toggleInfo("hub:" + m.name, more), `Details for ${m.title}`);
+  if (m.state === "downloading") {
+    rowButton(row, "Cancel", "setting-button model-action", () => modelAction("cancel", m.name));
+  } else if (onBoard) {
+    rowButton(row, "Re-download", "setting-button model-action hub-redownload", () => modelAction("redownload", m.name));
+  } else {
+    if (m.partial_bytes) rowButton(row, "🗑", "hub-info hub-danger", () => modelAction("discard", m.name), "Discard the partial download");
+    rowButton(row, m.partial_bytes ? "Resume" : "Download", "setting-button model-action model-load", () => modelAction("download", m.name));
+  }
+  const more = moreBox(row, { ...m, name: "hub:" + m.name }, []);
   if (m.progress) {
     const p = m.progress;
     const pr = document.createElement("div");
-    pr.className = "prog";
+    pr.className = "hub-progress-wrap";
     const what = p.stage === "download" ? `${fmtBytes(p.done_bytes)} of ${fmtBytes(p.total_bytes)} · ${fmtBytes(p.bytes_per_second)}/s` +
       (p.seconds_left != null ? ` · ${p.seconds_left} s left` : "") : p.stage === "unpack" ? "Unpacking…" : "Checking files…";
-    pr.innerHTML = `<div class="bar"><span style="width:${(p.fraction * 100).toFixed(1)}%"></span></div><div class="txt"></div>`;
-    pr.querySelector(".txt").textContent = what;
-    el.append(pr);
+    pr.innerHTML = `<div class="hub-progress"><div class="hub-progress-fill" style="width:${(p.fraction * 100).toFixed(1)}%"></div></div><div class="hub-sub"></div>`;
+    pr.querySelector(".hub-sub").textContent = what;
+    row.append(pr);
   }
   if (m.error) {
     const e = document.createElement("div");
-    e.className = "err";
+    e.className = "hub-note error";
     e.textContent = m.error;
-    el.append(e);
+    row.append(e);
   }
-  return el;
+  return row;
 }
 
 async function modelAction(action, name) {
@@ -1420,6 +1562,11 @@ function init() {
     });
   $$(".nav-item").forEach((b) => (b.onclick = () => openSettings(b.dataset.pane)));
   $("#settings").addEventListener("click", (e) => { if (e.target === $("#settings")) $("#settings").close(); });
+  for (const id of ["#model-search", "#model-filter-type", "#model-filter-family", "#model-sort",
+    "#hub-search", "#hub-filter-type", "#hub-filter-family", "#hub-sort"])
+    $(id).addEventListener(id.endsWith("search") ? "input" : "change", renderModels);
+  $("#model-rescan").onclick = () => refreshModels();
+  $("#hub-refresh").onclick = () => refreshModels();
   $("#reset-mla").onclick = async () => {
     if (!(await confirmBox("Reset the MLA? This unloads the model for everyone using the studio.", "Reset"))) return;
     try {

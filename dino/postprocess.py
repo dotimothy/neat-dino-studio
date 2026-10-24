@@ -78,3 +78,31 @@ def hf_style(logits, boxes, pr: Prompt, lb: Letterbox, tok: Tokenizer, box_thres
         pm[pr.n_tokens - 1:] = False
         labels.append(tok.decode(pr.input_ids[pm]))
     return score[keep], lb.boxes_to_source(boxes[keep]), labels
+
+
+def nms_np(boxes: np.ndarray, scores: np.ndarray, labels: np.ndarray, iou_thr: float) -> np.ndarray:
+    """Per-label greedy NMS, vectorised: boxes (n, 4) xyxy, scores sorted or not -> kept indices
+    in descending score order."""
+    order = np.argsort(-scores, kind="stable")
+    keep = []
+    for lab in np.unique(labels):
+        idx = order[labels[order] == lab]
+        b = boxes[idx]
+        area = (b[:, 2] - b[:, 0]).clip(0) * (b[:, 3] - b[:, 1]).clip(0)
+        alive = np.ones(len(idx), bool)
+        for i in range(len(idx)):
+            if not alive[i]:
+                continue
+            keep.append(idx[i])
+            rest = np.nonzero(alive[i + 1:])[0] + i + 1
+            if not len(rest):
+                break
+            ix0 = np.maximum(b[i, 0], b[rest, 0])
+            iy0 = np.maximum(b[i, 1], b[rest, 1])
+            ix1 = np.minimum(b[i, 2], b[rest, 2])
+            iy1 = np.minimum(b[i, 3], b[rest, 3])
+            inter = (ix1 - ix0).clip(0) * (iy1 - iy0).clip(0)
+            iou_ = inter / np.maximum(area[i] + area[rest] - inter, 1e-9)
+            alive[rest[iou_ >= iou_thr]] = False
+    keep = np.asarray(keep, int)
+    return keep[np.argsort(-scores[keep], kind="stable")]

@@ -41,6 +41,9 @@ Type or say what to find — <code>person . red car . dog with a frisbee .</code
   Grounding DINO Base. Grounding DINO **Tiny** (576 px) is also supported: a bit quicker and a smaller bundle. All bf16.
 - **SAM 3, with masks.** Meta's [SAM 3](https://ai.meta.com/research/sam3/) (Segment Anything with Concepts) runs as a third
   model family: the same prompts, voice and Live mode, and every match gets a mask as well as a box (see below).
+- **OmDet-Turbo, the fast one.** [OmDet-Turbo Tiny](https://huggingface.co/omlab/omdet-turbo-swin-tiny-hf)
+  (Apache-2.0) is a real-time open-vocabulary detector: ~145 ms per image on the board, half of Grounding DINO Tiny,
+  and a little more accurate on our COCO subset (see below).
 - **Masks for Grounding DINO too (Grounded EfficientSAM).** Turn on *Show Masks* and EfficientSAM (Ti or S) turns each
   box above the thresholds into a mask, on the MLA next to the detector (see below).
 
@@ -173,6 +176,31 @@ Build: `.venv-sam3` with transformers 5 (SAM 3's weights are gated: accept the l
 `model/sam3_export.py --size 672`, `compile/build_programs.sh sam3_672`, `tools/make_sam3_bundle.py --size 672`, and
 `tools/sam3_e2e.py` to check the board against PyTorch. The SAM 3 bundle is not on Hugging Face yet.
 
+## OmDet-Turbo (fast open-vocabulary detection)
+
+[omlab/omdet-turbo-swin-tiny-hf](https://huggingface.co/omlab/omdet-turbo-swin-tiny-hf) (Apache-2.0, 115 M parameters:
+Swin-T, an RT-DETR hybrid encoder, CLIP text, a 6-layer deformable decoder) at 640 px in bf16: 29 ELFs, a 1.15 GB
+bundle, loaded from Settings → Models like the other detectors. It is the open stand-in for an "efficient Grounding
+DINO": IDEA's own Grounding DINO 1.5 Edge is API-only. Its encoder has no deformable attention (one plain attention
+layer plus convolutions), which is where Grounding DINO spends most of its board time. Each phrase is a class; the
+task prompt "Detect a, b, c." must fit 64 CLIP tokens.
+
+| On a Modalix DevKit | OmDet-Turbo Tiny 640 | Grounding DINO Tiny 576 | Grounding DINO Base 576 |
+|---|---|---|---|
+| New image (runtime) | ~145 ms | ~290 ms | ~360 ms |
+| Prompt change, same image | ~78 ms | | |
+| COCO val2017, 500-image subset, box AP (board) | 43.5 (fp32 PyTorch 43.6) | 41.8 | 42.0 |
+
+Board split (`runtime/src/omdet_rt.cpp`): 12 Swin-T blocks in window layout (timm rolls before padding, so the CPU's
+layout tables differ from the HF Swin of Grounding DINO), the hybrid encoder's attention layer, the FPN/PAN convs
+(one program with three outputs, written one level after another into the decoder's token buffer), the value
+projections and encoder head, 6 + 6 decoder programs, and the CLIP text encoder (8 sequences per run) with the task
+head. The CPU does the deformable sampling (3 levels), cosine class scores, the top-900 and the box updates.
+Time per new image: backbone 43 ms MLA + 11 ms CPU, encoder 10, selection 8, decoder 47 MLA + 22 CPU.
+
+Build: `model/omdet_export.py`, `compile/build_programs.sh omdet`, `tools/make_omdet_bundle.py`, and
+`tools/omdet_e2e.py` / `eval/coco_eval.py --backend omdet` to check the board against PyTorch.
+
 ## Grounded EfficientSAM (masks for Grounding DINO)
 
 [EfficientSAM](https://github.com/yformer/EfficientSAM) (Apache-2.0) in two sizes, Ti (10.2 M parameters) and S
@@ -208,4 +236,4 @@ with it. Inter and JetBrains Mono fonts under the SIL Open Font License. The voi
 (Whisper, Gemma, LFM) are not part of this repository; they are installed separately under
 their own licenses. SAM 3's weights are under Meta's SAM License (https://github.com/facebookresearch/sam3/blob/main/LICENSE),
 not Apache-2.0; a SAM 3 bundle carries a copy of it. EfficientSAM (code in `third_party/efficient_sam/` and weights)
-© Meta / the EfficientSAM authors, Apache-2.0.
+© Meta / the EfficientSAM authors, Apache-2.0. OmDet-Turbo (weights) © Om AI Lab, Apache-2.0.

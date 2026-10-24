@@ -142,6 +142,46 @@ class Sam3Backend(Backend):
             self.rt.close()
 
 
+class OmdetBackend(Backend):
+    """OmDet-Turbo on the board (omdet_rt). Phrases are its classes; the task prompt is
+    "Detect a, b." and must fit 64 CLIP tokens. A prompt change on the same image reruns only the
+    selection and the decoder."""
+    name = "mla"
+    kind = "omdet"
+    MAX_PHRASES = 16
+
+    def __init__(self, binary, bundle, log=None, progress=None):
+        from dino.omdet_client import OmdetRuntime
+        with ACCELERATOR_LOCK:
+            self.rt = OmdetRuntime(binary, bundle, log=log, progress=progress)
+        self.size = self.rt.size
+        self.tokenizer = self.rt.text.tok
+
+    phrases = staticmethod(lambda text, cap=True: Sam3Backend.phrases(text, cap=False))
+
+    def build_prompt(self, text):
+        """Phrases that fit: classes are dropped from the end until the task prompt fits."""
+        from types import SimpleNamespace
+        ph = self.phrases(text)[: self.MAX_PHRASES]
+        dropped = self.phrases(text)[self.MAX_PHRASES:]
+        while ph and len(self.tokenizer.encode(self.rt.text.task(ph), 1000)) > self.rt.TT:
+            dropped.insert(0, ph.pop())
+        n = len(self.tokenizer.encode(self.rt.text.task(ph), 1000)) if ph else 0
+        return SimpleNamespace(phrases=ph, caption=" . ".join(ph) + (" ." if ph else ""), n_tokens=n, truncated=dropped)
+
+    def set_prompt(self, pr) -> float:
+        with ACCELERATOR_LOCK:
+            return self.rt.set_classes(pr.phrases)
+
+    def detect(self, rgb, vw=None, vh=None, same_image=False):
+        with ACCELERATOR_LOCK:
+            return self.rt.detect_cached() if same_image else self.rt.detect(rgb)
+
+    def close(self):
+        with ACCELERATOR_LOCK:
+            self.rt.close()
+
+
 class TorchBackend(Backend):
     """HF reference on a PC (CUDA when available). Same letterbox and prompt handling as the board."""
     name = "torch"

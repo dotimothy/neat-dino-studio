@@ -107,6 +107,13 @@ def model_info(name: str | None, manifest: dict | None = None) -> dict | None:
                 "short": f"ESAM {v['name']}",
                 "details": f"yformer/EfficientSAM · EfficientSAM-{v['name']}, {v['params']} parameters (ViT-{v['name']}) · "
                            f"{size}×{size} input · {prec} · masks for the detector's boxes" + (f" · {n} ELFs" if n else "")}
+    if m.get("kind") == "omdet" or name.startswith("omdet"):
+        n = len(m.get("programs", []))
+        return {"name": name, "kind": "omdet", "size": size, "precision": prec, "upstream": "omlab/omdet-turbo-swin-tiny-hf",
+                "variant": "omdet", "title": f"OmDet-Turbo Tiny · {size} px · {prec}", "short": f"OmDet-T {size}",
+                "details": f"omlab/omdet-turbo-swin-tiny-hf · OmDet-Turbo, 115 M parameters (Swin-T + CLIP text) · "
+                           f"{size}×{size} input · {prec} · real-time open-vocabulary detection" +
+                           (f" · {n} ELFs" if n else "")}
     if m.get("kind") == "sam3" or name.startswith("sam3"):
         n = len(m.get("programs", []))
         return {"name": name, "kind": "sam3", "size": size, "precision": prec, "upstream": "facebook/sam3",
@@ -197,7 +204,7 @@ def read_bundle(d: Path) -> dict | None:
         m = json.loads((d / "manifest.json").read_text())
     except (OSError, ValueError):
         return None
-    if m.get("kind") not in ("detector", "text", "sam3", "esam"):
+    if m.get("kind") not in ("detector", "text", "sam3", "esam", "omdet"):
         return None
     return m
 
@@ -271,7 +278,7 @@ class Hub:
                 if not (self.NAME.fullmatch(name) and re.fullmatch(r"[a-z0-9][a-z0-9_.-]{0,48}", e["path"])
                         and len(files) == 1 and self.FILE.fullmatch(files[0]["name"])
                         and isinstance(files[0]["bytes"], int) and re.fullmatch(r"[0-9a-f]{64}", files[0]["sha256"])
-                        and e.get("kind") in ("detector", "text", "sam3", "esam")):
+                        and e.get("kind") in ("detector", "text", "sam3", "esam", "omdet")):
                     raise ValueError(f"the entry for {name!r} is not one this app understands")
                 models[name] = e
             self._models, self._error = models, None
@@ -459,7 +466,7 @@ class Studio:
         local = local_bundles(self.models_dir)
         hub = self.hub.models()
         names = sorted(set(local) | set(hub), key=lambda n: (0 if (local.get(n) or hub.get(n, {})).get("kind") in
-                                                              ("detector", "sam3") else 1, n))
+                                                              ("detector", "sam3", "omdet") else 1, n))
         job = self.hub.job()
         out = []
         for n in names:
@@ -543,43 +550,78 @@ class Studio:
             choices = choices or [{"name": "esam-ti768-bf16", "short": "ESAM Ti", "title": "EfficientSAM Ti (fake)"}]
         mk = self.masker
         return {"model": self.mask_model, "state": self.mask_state, "error": self.mask_error, "choices": choices,
+                "wanted": self.prefs().get("masks"),
                 "mask_size": mk.mask_size if mk else None, "max": MAX_MASKS,
                 "info": model_info(self.mask_model, local.get(self.mask_model, {})) if self.mask_model else None}
 
-    def set_masks(self, name: str | None, who: str = "") -> None:
-        """Load EfficientSAM `name` for masks (replacing the current one), or None to turn masks off."""
+    def set_masks(self, name: str | None, who: str = "", remember: bool = True) -> None:
+        """Turn masks on with EfficientSAM `name` (replacing the current one), or off (None).
+
+        Masks follow the detector: the choice is remembered, and the mask model only loads while a
+        Grounding DINO or OmDet detector is loaded (it is unloaded with the detector, and for SAM 3,
+        which makes its own masks)."""
         if name and self.args.backend != "fake":
             m = local_bundles(self.models_dir).get(name)
             if m is None or m.get("kind") != "esam":
                 raise StudioError(f"{name} is not a mask model on this board")
         with self.lock:
-            if self.mask_state == "loading":
-                raise StudioError("The mask model is still loading")
+            if self.mask_state in ("loading", "unloading"):
+                raise StudioError(f"The mask model is still {self.mask_state}; try again in a moment")
+            if remember:
+                self._save_prefs(masks=name)
+                self._record(f"masks on ({name})" if name else "masks off", who)
+            if name and not self._detector_ready():
+                # nothing to make masks for yet: it loads with the next detector
+                if self.masker is None:
+                    self.mask_model, self.mask_error = None, None
+                    return
+                name = None
             if name == self.mask_model and self.mask_state == "ready":
+                return
+            if name is None and self.masker is None and self.mask_state != "error":
+                self.mask_model = None
                 return
             old, self.masker = self.masker, None
             self.mask_model, self.mask_error = name, None
-            self.mask_state = "loading" if name else "off"
-            self._record(f"masks on ({name})" if name else "masks off", who)
-        self._save_prefs(masks=name)
+            self.mask_state = "loading" if name else ("unloading" if old is not None else "off")
         threading.Thread(target=self._masks_load, args=(old, name), name="masks-load", daemon=True).start()
 
-    def _masks_load(self, old, name) -> None:
+    def _detector_ready(self) -> bool:
+        b = self.backend
+        return b is not None and self.state == "ready" and getattr(b, "kind", "") != "sam3"
+
+    def _masks_follow_detector(self) -> None:
+        """After a detector loads or unloads: load the remembered mask model, or unload it."""
+        want = self.prefs().get("masks") if self._detector_ready() else None
+        if want and not (local_bundles(self.models_dir).get(want) or self.args.backend == "fake"):
+            want = None
         try:
-            if old is not None:
-                old.close()
-            if not name:
-                return
-            if self.args.backend == "fake":
-                b = backends.FakeEsamBackend()
-            elif self.args.backend != "mla":
-                raise StudioError("masks need the board (esam_rt)")
-            else:
-                with self.mla_load_lock:
+            if want != self.mask_model or (want is None and self.masker is not None):
+                self.set_masks(want, "auto", remember=False)
+        except StudioError as e:
+            log(f"masks: {e}")
+
+    def _masks_load(self, old, name) -> None:
+        # one MLA client loads or unloads at a time (detector, voice, masks)
+        try:
+            with self.mla_load_lock:
+                if old is not None:
+                    old.close()
+                if not name:
+                    with self.lock:
+                        if self.mask_state == "unloading":
+                            self.mask_state = "off"
+                    log("masks unloaded")
+                    return
+                if self.args.backend == "fake":
+                    b = backends.FakeEsamBackend()
+                elif self.args.backend != "mla":
+                    raise StudioError("masks need the board (esam_rt)")
+                else:
                     b = backends.EsamBackend(Path(self.args.runtime).with_name("esam_rt"), self.models_dir / name,
                                              log=lambda s: log(f"  esam_rt: {s}"))
             with self.lock:
-                if self.mask_model == name:
+                if self.mask_model == name and self.mask_state == "loading":
                     self.masker, self.mask_state = b, "ready"
                     log(f"masks ready: {name}")
                     return
@@ -588,7 +630,9 @@ class Studio:
             with self.lock:
                 if self.mask_model == name:
                     self.mask_state, self.mask_error = "error", f"Loading {name} failed: {e}"
-            log(f"masks: loading {name} failed: {e}")
+                elif self.mask_state == "unloading":
+                    self.mask_state = "off"
+            log(f"masks: {'loading ' + name if name else 'unloading'} failed: {e}")
 
     # ---- preferences that survive a restart (voice on/off)
     def prefs(self) -> dict:
@@ -645,7 +689,7 @@ class Studio:
             local = local_bundles(self.models_dir)
             if self.args.backend == "mla":
                 m = local.get(name)
-                if m is None or m.get("kind") not in ("detector", "sam3"):
+                if m is None or m.get("kind") not in ("detector", "sam3", "omdet"):
                     raise StudioError(f"{name} is not a detector on this board")
                 req = m.get("requires")
                 if req and req not in local:
@@ -677,6 +721,7 @@ class Studio:
                 self.load_seconds = round(time.time() - self.load_started, 1)
                 self.last_image = None
                 log(f"{name} ready in {self.load_seconds} s")
+            self._masks_follow_detector()
         except Exception as e:  # noqa: BLE001
             with self.lock:
                 self.backend, self.state, self.stage = None, "error", None
@@ -701,6 +746,9 @@ class Studio:
 
         def progress(done, total, stage):
             self.progress = {"done": done, "total": total, "stage": stage}
+        if m.get("kind") == "omdet":
+            return backends.OmdetBackend(Path(self.args.runtime).with_name("omdet_rt"), self.models_dir / name,
+                                         log=lambda s: log(f"  omdet_rt: {s}"), progress=progress)
         if m.get("kind") == "sam3":
             binary = Path(self.args.runtime).with_name("sam3_rt")
             return backends.Sam3Backend(binary, self.models_dir / name, log=lambda s: log(f"  sam3_rt: {s}"),
@@ -723,6 +771,7 @@ class Studio:
                     self.backend.close()        # SIGTERM to dino_rt: it frees the MLA
                 self.backend, self.model, self.state, self.stage, self.error = None, None, "empty", None, None
                 self.last_image = None
+            self._masks_follow_detector()
         t = threading.Thread(target=work, name="model-unload", daemon=True)
         t.start()
         if wait:
@@ -830,6 +879,84 @@ class Studio:
                 "truncated": False, "tokens": len(phrases), "detections": dets[:300], "timing": timing,
                 "same_image": same, "mask_size": b.mask_size}
 
+    def detect_omdet(self, image_bytes, text, image_id, nms, masks=None):
+        """OmDet-Turbo: per query the score of every phrase (class), boxes over the squashed image."""
+        from dino.letterbox import Squash
+        t0 = time.time()
+        same = image_bytes is None
+        b = self.backend
+        rgb = geo = None
+        mk = self.masker if masks and self.mask_state == "ready" else None
+        job = None
+        if not same:
+            img = Image.open(io.BytesIO(image_bytes))
+            if img.format == "JPEG":
+                big = max(b.size, mk.size if mk else 0)
+                img.draft("RGB", (big, big))
+            img = ImageOps.exif_transpose(img).convert("RGB")
+            geo = Squash(b.size, img.width, img.height)
+            rgb = np.asarray(img.resize((b.size, b.size), Image.BILINEAR), np.uint8)
+            if mk is not None:
+                sq = np.asarray(img.resize((mk.size, mk.size), Image.BILINEAR), np.uint8)
+                job = mk.start(sq, hashlib.sha1(image_bytes).hexdigest()[:16])
+        dec_ms = (time.time() - t0) * 1e3
+        try:
+            pr = b.build_prompt(text)
+            if not pr.phrases:
+                raise StudioError("Type at least one thing to find, e.g. “person . dog .”")
+            with self.lock:
+                text_ms = b.set_prompt(pr)
+                if same:
+                    if image_id is None or image_id != self.last_image:
+                        raise StudioError("The image is gone from the board; send it again")
+                    geo = self._last_lb
+                    if mk is not None:
+                        job = mk.start(None, image_id)
+                r = b.detect(rgb, same_image=same)
+                if not same:
+                    self.last_image = hashlib.sha1(image_bytes).hexdigest()[:16]
+                    self._last_lb = geo
+                model, image_ref = self.model, self.last_image
+            t_post = time.time()
+            sc = r.scores                                              # (900, P)
+            best, ph = sc.max(1), sc.argmax(1)
+            keep = np.nonzero(best > 0.05)[0]
+            keep = keep[np.argsort(-best[keep])][:300]
+            cx, cy, w_, h_ = r.boxes[keep].T
+            W, H = geo.width, geo.height
+            xyxy = np.stack([(cx - w_ / 2) * W, (cy - h_ / 2) * H, (cx + w_ / 2) * W, (cy + h_ / 2) * H], 1)
+            xyxy = np.clip(xyxy, 0, [W, H, W, H])
+            kj = postprocess.nms_np(xyxy, best[keep], ph[keep], nms or 0.5)   # OmDet's own post-processing: NMS 0.5
+            dets = [{"box": [round(float(v), 1) for v in xyxy[j]], "score": round(float(best[keep[j]]), 4),
+                     "phrase": int(ph[keep[j]]), "phrase_scores": [round(float(v), 4) for v in sc[keep[j]]],
+                     "query": int(keep[j])} for j in kj]
+            extra, mtime = {}, {}
+            t_masks = time.time()
+            if job is not None:
+                extra, mtime = self._masks_for(mk, job, dets, masks, W, H)
+        finally:
+            if job is not None:
+                job.boxes(None)
+        rename = {"backbone_mla": "backbone", "patchify": "backbone_cpu", "select_cpu": "topk"}
+        timing = {}
+        for k, v in r.timing.items():
+            if v and k != "total":
+                k2 = rename.get(k, k)
+                timing[k2] = round(timing.get(k2, 0) + v, 1)
+        timing["text"] = round(text_ms, 1)
+        if not same:
+            timing["decode"] = round(dec_ms, 1)
+        timing["postprocess"] = round((t_masks - t_post) * 1e3, 1)
+        timing.update(mtime)
+        total = (time.time() - t0) * 1e3
+        timing["server_total"] = round(total, 1)
+        self.last_ms = round(total, 1)
+        return {"model": model, "size": b.size, "image_id": image_ref, "width": geo.width, "height": geo.height,
+                "caption": pr.caption, "phrases": [{"text": p, "color": PALETTE[i % len(PALETTE)]}
+                                                   for i, p in enumerate(pr.phrases)],
+                "truncated": pr.truncated, "tokens": pr.n_tokens, "detections": dets, "timing": timing,
+                "same_image": same, **extra}
+
     def detect(self, image_bytes: bytes | None, text: str, image_id: str | None, nms: float | None,
                masks: tuple[float, float] | None = None) -> dict:
         """One detection. Decoding and post-processing run outside the lock, and the runtime
@@ -837,6 +964,8 @@ class Studio:
         masks = (box score, phrase score) thresholds: EfficientSAM masks for the boxes above them."""
         if getattr(self.backend, "kind", "") == "sam3" and self.state == "ready":
             return self.detect_sam3(image_bytes, text, image_id, nms)
+        if getattr(self.backend, "kind", "") == "omdet" and self.state == "ready":
+            return self.detect_omdet(image_bytes, text, image_id, nms, masks)
         t0 = time.time()
         same = image_bytes is None
         dec_ms = 0.0
@@ -971,7 +1100,7 @@ class Studio:
             raise StudioError("Could not reset the MLA (needs passwordless sudo or DINO_RESET_COMMAND)")
 
     def close(self) -> None:
-        self.voice.close()
+        # the MLA programs first (each stops in well under a second), the voice sidecar last
         with self.lock:
             if self.masker is not None:
                 self.masker.close()
@@ -979,6 +1108,7 @@ class Studio:
             if self.backend is not None:
                 self.backend.close()
                 self.backend = None
+        self.voice.close()
 
 
 # --------------------------------------------------------------------------- web app
@@ -1222,11 +1352,6 @@ def main() -> int:
     studio = Studio(args)
     if args.model:
         studio.load(args.model, "startup")
-    if studio.prefs().get("masks"):                 # masks were on when the studio last stopped
-        try:
-            studio.set_masks(studio.prefs()["masks"], "startup")
-        except StudioError as e:
-            log(f"masks: {e}")
     if args.backend == "mla" and (args.voice == "on" or (args.voice == "auto" and studio.prefs().get("voice"))):
         try:
             studio.voice.start(llm=studio.prefs().get("voice_llm"))
