@@ -1,19 +1,20 @@
 #!/usr/bin/env bash
-# Compile every exported SAM 3 program of one size (model/sam3_export.py) to its own MLA ELF.
-#   compile/build_sam3.sh 672 [stage ...]        JOBS=6 by default
-# Reads build/probes/sam3_<S>_<stage>.onnx; writes build/stages/bf16/sam3_<S>_<stage>/.
+# Compile every exported program with one name prefix to its own MLA ELF.
+#   compile/build_programs.sh sam3_672 [stage ...]      SAM 3 (model/sam3_export.py)
+#   compile/build_programs.sh esam_ti768 [stage ...]    EfficientSAM (model/esam_export.py)
+# JOBS=6 by default. Reads build/probes/<prefix>_<stage>.onnx; writes build/stages/bf16/<prefix>_<stage>/.
 set -uo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd -P)"
 cd "$ROOT"
-S="$1"; shift
+P="$1"; shift
 JOBS="${JOBS:-6}"
 names=()
-if [[ $# -gt 0 ]]; then for st in "$@"; do names+=("sam3_${S}_$st"); done
-else for f in build/probes/sam3_${S}_*.onnx; do names+=("$(basename "$f" .onnx)"); done; fi
+if [[ $# -gt 0 ]]; then for st in "$@"; do names+=("${P}_$st"); done
+else for f in build/probes/${P}_*.onnx; do names+=("$(basename "$f" .onnx)"); done; fi
 # the biggest graphs first, so the long compiles start early
 ordered=()
-for n in "${names[@]}"; do [[ "$n" == *_vit* || "$n" == *_text ]] && ordered+=("$n"); done
-for n in "${names[@]}"; do [[ "$n" == *_vit* || "$n" == *_text ]] || ordered+=("$n"); done
+for n in "${names[@]}"; do [[ "$n" == *_vit* || "$n" == *_text || "$n" == *_enc ]] && ordered+=("$n"); done
+for n in "${names[@]}"; do [[ "$n" == *_vit* || "$n" == *_text || "$n" == *_enc ]] || ordered+=("$n"); done
 for n in "${ordered[@]}"; do
   out="build/stages/bf16/$n"
   if [[ -f "$out/compile_summary.json" ]] && grep -q '"single_mla_elf": true' "$out/compile_summary.json"; then continue; fi

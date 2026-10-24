@@ -220,3 +220,88 @@ class FakeBackend(Backend):
 
     def close(self):
         pass
+
+
+class MaskJob:
+    """One frame's masks: the encoder starts as soon as the image arrives (while Grounding DINO runs),
+    the decoder runs once the boxes are known. Jobs run one after another (the image embedding on
+    the board belongs to one frame at a time)."""
+
+    def __init__(self):
+        self._boxes: Future = Future()
+        self.result: Future = Future()
+        self.encode_ms: dict = {}
+
+    def boxes(self, boxes_xyxy):
+        """(n, 4) boxes in the masker's S x S image, or None to cancel."""
+        if not self._boxes.done():
+            self._boxes.set_result(boxes_xyxy)
+
+
+class EsamBackend:
+    """EfficientSAM masks for detector boxes (esam_rt), alongside the detector."""
+    kind = "esam"
+
+    def __init__(self, binary, bundle, log=None, progress=None):
+        from dino.esam_client import EsamRuntime
+        with ACCELERATOR_LOCK:
+            self.rt = EsamRuntime(binary, bundle, log=log, progress=progress)
+        self.size, self.mask_size = self.rt.size, self.rt.M
+        self._lock = threading.Lock()
+        self._image = None          # id of the image whose embedding is on the board
+        self._rgb = None            # (id, rgb) of the last image, to re-encode for a prompt-only run
+
+    def start(self, rgb, image_id) -> MaskJob:
+        """rgb (S, S, 3) uint8 squashed image, or None for the last image (prompt changed only)."""
+        if rgb is not None:
+            self._rgb = (image_id, rgb)
+        elif self._rgb and self._rgb[0] == image_id:
+            rgb = self._rgb[1]
+        job = MaskJob()
+
+        def work():
+            try:
+                with self._lock:
+                    if self._image != image_id or image_id is None:
+                        if rgb is None:
+                            raise RuntimeError("the image for the masks is gone; send it again")
+                        job.encode_ms = self.rt.encode(rgb)
+                        self._image = image_id
+                    boxes = job._boxes.result(timeout=60)
+                    if boxes is None or not len(boxes):
+                        job.result.set_result(None)
+                        return
+                    job.result.set_result(self.rt.masks(boxes))
+            except Exception as e:  # noqa: BLE001
+                if not job.result.done():
+                    job.result.set_exception(e)
+        threading.Thread(target=work, name="masks", daemon=True).start()
+        return job
+
+    def close(self):
+        with ACCELERATOR_LOCK:
+            self.rt.close()
+
+
+class FakeEsamBackend(EsamBackend):
+    """Tests: each box's mask is the box itself."""
+
+    def __init__(self, size=768, upsample=2):
+        self.size, self.mask_size = size, size // 4 * upsample
+        self._lock = threading.Lock()
+        self._image = self._rgb = None
+        M, sc = self.mask_size, self.mask_size / size
+
+        class _RT:
+            def encode(self, rgb):
+                return {"patchify": 0.1, "encoder": 1.0, "neck": 0.1, "total": 1.2}
+
+            def masks(self, boxes):
+                out = np.zeros((len(boxes), M, M), bool)
+                for i, (x0, y0, x1, y1) in enumerate(np.asarray(boxes) * sc):
+                    out[i, int(max(0, y0)):int(np.ceil(y1)), int(max(0, x0)):int(np.ceil(x1))] = True
+                return out, np.full(len(boxes), 0.9, np.float32), {"decoder": 1.0, "masks_cpu": 0.1, "total": 1.1}
+
+            def close(self):
+                pass
+        self.rt = _RT()

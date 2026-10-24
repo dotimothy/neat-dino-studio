@@ -24,3 +24,8 @@ resized and cropped for thumbnails. Sources:
 SAM 3 (facebook/sam3) weights, and bundles built from them by tools/make_sam3_bundle.py, are
 under the SAM License (Meta, November 19, 2025), included as LICENSE in each SAM 3 bundle. The
 code in this repository that exports, compiles and runs SAM 3 is Apache-2.0.
+
+EfficientSAM (yformer/EfficientSAM): the model code in third_party/efficient_sam/ and the
+EfficientSAM-Ti / -S weights used by the esam-* bundles, Copyright Meta Platforms, Inc. and
+affiliates, licensed under the Apache License 2.0 (third_party/efficient_sam/LICENSE, also
+included as LICENSE in each EfficientSAM bundle).

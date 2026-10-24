@@ -84,3 +84,34 @@ def test_model_names_per_variant():
     assert t["title"].startswith("Grounding DINO Tiny · 576") and t["short"] == "DINO-T 576"
     assert "172.2 M" in t["details"] and "grounding-dino-tiny" in t["upstream"]
     assert server.model_info("dino-tiny-text-t64-bf16")["title"].startswith("Grounding DINO Tiny · Text")
+
+
+def test_masks_toggle_and_detect(client):
+    import base64
+    import numpy as np
+    assert client.post("/api/models/load", json={"name": "dino-576-bf16"}).status_code == 200
+    assert wait_ready(client)["state"] == "ready"
+    m = client.get("/api/status").get_json()["masks"]
+    assert m["state"] == "off" and m["choices"]
+    assert client.post("/api/masks", json={"model": m["choices"][0]["name"]}).status_code == 200
+    for _ in range(100):
+        m = client.get("/api/status").get_json()["masks"]
+        if m["state"] != "loading":
+            break
+        time.sleep(0.05)
+    assert m["state"] == "ready", m
+    form = {"prompt": "cat . dog .", "masks": "0.0,0.0", "image": (io.BytesIO(jpeg()), "a.jpg")}
+    d = client.post("/api/detect", data=form).get_json()
+    M = d["mask_size"]
+    with_mask = [x for x in d["detections"] if "mask" in x]
+    assert M and with_mask and len(with_mask) <= m["max"]
+    bits = np.unpackbits(np.frombuffer(base64.b64decode(with_mask[0]["mask"]), np.uint8))[:M * M]
+    assert bits.sum() > 0                                   # the fake mask is the box
+    # prompt-only rerun: the masker reuses its image
+    d2 = client.post("/api/detect", data={"prompt": "bird .", "masks": "0.0,0.0",
+                                          "image_id": d["image_id"]}).get_json()
+    assert d2["same_image"] and "mask_error" not in d2 and any("mask" in x for x in d2["detections"])
+    # without the field there are no masks
+    d3 = client.post("/api/detect", data={"prompt": "bird .", "image_id": d["image_id"]}).get_json()
+    assert "mask_size" not in d3
+    assert client.post("/api/masks", json={"model": None}).get_json()["state"] == "off"

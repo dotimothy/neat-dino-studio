@@ -18,6 +18,8 @@ const TIMING_PARTS = [
   ["encoder_mla", "Encoder MLA", "#16c8a6"], ["encoder_cpu", "Encoder CPU", "#4bb54a"],
   ["dec_values", "Values", "#1fc3e8"], ["topk", "Top-K", "#a9c81c"],
   ["decoder_mla", "Decoder MLA", "#f2801d"], ["decoder_cpu", "Decoder CPU", "#ffc21a"],
+  ["masks_encoder", "Mask Encoder MLA", "#e0569b"], ["masks_decoder", "Mask Decoder MLA", "#f08cc0"],
+  ["masks_cpu", "Masks CPU", "#c9a3b8"],
 ];
 
 const S = {
@@ -69,7 +71,8 @@ async function refreshStatus() {
   renderStatus();
   clearTimeout(refreshStatus.t);
   const vs = S.status && S.status.voice;
-  const loading = S.status && (S.status.state === "loading" || (vs && (vs.state === "loading" || (vs.models || []).some((m) => m.job))));
+  const loading = S.status && (S.status.state === "loading" || (S.status.masks && S.status.masks.state === "loading") ||
+    (vs && (vs.state === "loading" || (vs.models || []).some((m) => m.job))));
   refreshStatus.t = setTimeout(refreshStatus, loading ? 800 : 4000);
 }
 
@@ -116,6 +119,77 @@ function renderStatus() {
   $("#about-status").textContent = `Server ${st.version}, backend ${st.backend}` + (st.size ? `, input ${st.size} px` : "") +
     (st.load_seconds ? `, loaded in ${st.load_seconds} s` : "");
   renderVoice();
+  renderMasks();
+}
+
+// --------------------------------------------------------------------- masks (EfficientSAM next to the detector)
+function masksActive() {
+  const st = S.status;
+  return !!(st && st.masks && st.masks.state === "ready" && st.state === "ready" && st.model_info && st.model_info.kind !== "sam3");
+}
+
+function renderMasks() {
+  const st = S.status, mk = st && st.masks;
+  const row = $("#mask-row"), note = $("#masks-note"), on = $("#masks-on"), sel = $("#masks-model");
+  const sam3 = !!(st && st.model_info && st.model_info.kind === "sam3");
+  if (!mk || sam3) {
+    row.hidden = true;
+    note.hidden = true;
+    return;
+  }
+  row.hidden = false;
+  const choices = mk.choices || [];
+  const key = choices.map((c) => c.name).join();
+  if (sel.dataset.k !== key) {
+    sel.innerHTML = "";
+    for (const c of choices) {
+      const o = document.createElement("option");
+      o.value = c.name;
+      o.textContent = c.short;
+      o.title = c.title;
+      sel.append(o);
+    }
+    sel.dataset.k = key;
+  }
+  sel.hidden = choices.length < 2;
+  if (mk.model && choices.some((c) => c.name === mk.model)) sel.value = mk.model;
+  else if (choices.some((c) => c.name === store.get("masks-model", ""))) sel.value = store.get("masks-model", "");
+  on.disabled = !choices.length || S.maskBusy;
+  if (!S.maskBusy) on.checked = mk.state === "loading" || mk.state === "ready";
+  note.classList.remove("err");
+  note.hidden = false;
+  if (!choices.length) {
+    note.innerHTML = 'Download EfficientSAM in <button class="link" id="masks-open">Settings → Models</button> to draw masks.';
+    $("#masks-open").onclick = () => openSettings("models");
+  } else if (mk.state === "loading") note.textContent = `Loading ${mk.info ? mk.info.short : "the mask model"}…`;
+  else if (mk.state === "error") {
+    note.textContent = mk.error || "The mask model failed to load.";
+    note.classList.add("err");
+  } else if (mk.state === "ready") note.textContent = `${mk.info ? mk.info.title.replace(" · Masks", "") : mk.model} · up to ${mk.max} boxes`;
+  if (mk.state === "ready" && st.state === "ready" && mk.info) $("#chip-model").textContent += ` + ${mk.info.short}`;
+  else note.hidden = true;
+  // just finished loading: redo the current photo so its masks appear
+  if (S.maskWasLoading && mk.state === "ready" && S.result && !S.cam && !S.live) setTimeout(() => detect(), 0);
+  S.maskWasLoading = mk.state === "loading";
+}
+
+async function setMasks(name) {
+  S.maskBusy = true;
+  try {
+    if (name) store.set("masks-model", name);
+    await post("/api/masks", { model: name || null });
+    if (name) S.maskWasLoading = true;      // rerun the photo once the masks are ready
+    if (!name && S.result && S.result.mask_size && !S.cam) {     // drop the masks shown
+      delete S.result.mask_size;
+      draw();
+    }
+  } catch (e) {
+    toast(e.message, true);
+  } finally {
+    S.maskBusy = false;
+    refreshStatus();
+    if ($("#settings").open) refreshModels();
+  }
 }
 
 // Model loading / unloading: what is happening, with a bar that moves.
@@ -166,6 +240,8 @@ function showBanner(text, err = false, action = null) {
 
 function prettyModel(n) {
   if (!n) return "No Model";
+  const es = /esam-(ti|s)(\d+)-(\w+)/.exec(n);
+  if (es) return `EfficientSAM ${es[1] === "ti" ? "Ti" : "S"} · ${es[2]} px · ${es[3]}`;
   const s3 = /sam3-(\d+)-(\w+)/.exec(n);
   if (s3) return `SAM 3 · ${s3[1]} px · ${s3[2]}`;
   const t = /dino-tiny-(\d+)-(\w+)/.exec(n);
@@ -360,6 +436,7 @@ async function detect(opts = {}) {
   const fd = new FormData();
   fd.append("prompt", text);
   if ($("#nms").checked) fd.append("nms", "0.5");
+  if (masksActive()) fd.append("masks", `${+$("#box-thr").value},${+$("#text-thr").value}`);
   if (blob) fd.append("image", blob, "image.jpg");
   else fd.append("image_id", S.imageId);
   try {
@@ -376,6 +453,13 @@ async function detect(opts = {}) {
       $("#fps").innerHTML = `${(1000 / avg).toFixed(1)}<small>FPS</small>`;
       $("#mi-fps").title = `${Math.round(avg)} ms between results, ${Math.round(r.timing.server_total)} ms per frame on the board`;
     }
+    if (r.mask_error && /gone/.test(r.mask_error) && S.imageBlob && !S.cam && !opts.resent) {
+      S.imageId = null;              // the mask model has not seen this image: send it again
+      S.busy = false;
+      setBusy(false);
+      return detect({ resent: true });
+    }
+    if (r.mask_error && !opts.live) toast(`Masks: ${r.mask_error}`, true);
     S.result = r;
     if (!S.cam) S.imageId = r.image_id;
     if (!opts.live) remember(text);
@@ -407,6 +491,7 @@ function setBusy(on) {
 const PART_KEYS = {
   text: ["text"], backbone: ["backbone", "backbone_cpu"], encoder: ["encoder_mla", "encoder_cpu"],
   decoder: ["dec_values", "topk", "decoder_mla", "decoder_cpu"],
+  masks: ["masks_encoder", "masks_decoder", "masks_cpu"],
 };
 function renderTiming(t) {
   $("#chipbar").hidden = false;
@@ -414,6 +499,7 @@ function renderTiming(t) {
   const label = Object.fromEntries(TIMING_PARTS.map(([k, l]) => [k, l]));
   const fmt = (ms) => `${Math.round(ms)}<small>ms</small>`;
   let shown = 0;
+  $("#mp-masks").hidden = !PART_KEYS.masks.some((k) => t[k]);
   for (const [part, keys] of Object.entries(PART_KEYS)) {
     const ms = keys.reduce((a, k) => a + (t[k] || 0), 0);
     shown += ms;
@@ -1202,7 +1288,7 @@ function modelRow(m) {
   const el = document.createElement("div");
   el.className = "model" + (m.loaded ? " loaded" : "");
   const st = S.status || {};
-  const busyHere = st.model === m.name && (st.state === "loading" || st.state === "unloading");
+  const busyHere = m.kind === "esam" ? !!m.loading : st.model === m.name && (st.state === "loading" || st.state === "unloading");
   const tags = [];
   if (busyHere) tags.push(`<span class="tag live">${st.state === "loading" ? "Loading" : "Unloading"}</span>`);
   else if (m.loaded) tags.push('<span class="tag live">Loaded</span>');
@@ -1214,6 +1300,7 @@ function modelRow(m) {
   el.querySelector(".name span").textContent = m.title;
   const meta = [m.details, fmtBytes(m.bytes)];
   if (m.kind === "text") meta.push(m.variant === "tiny" ? "used by the Tiny detector" : "used by every Base detector");
+  if (m.kind === "esam") meta.push("runs next to a Grounding DINO detector");
   if (m.latency_ms) meta.push(`~${Math.round(m.latency_ms)} ms per image`);
   if (m.kind === "detector" && m.requires && !m.requires_present) meta.push("needs the text encoder");
   el.querySelector(".meta").textContent = meta.filter(Boolean).join(" · ") + (m.about ? ` — ${m.about}` : "");
@@ -1248,6 +1335,9 @@ function modelRow(m) {
     if (m.kind === "detector" || m.kind === "sam3") {
       if (m.loaded) btn("Unload", "stop", () => modelAction("unload", m.name));
       else btn("Load", "chip", () => modelAction("load", m.name), "primary");
+    } else if (m.kind === "esam") {
+      if (m.loaded) btn("Unload", "stop", () => setMasks(null));
+      else btn("Load", "chip", () => setMasks(m.name), "primary");
     }
     btn("Verify", "shield", () => modelAction("verify", m.name));
     if (m.on_hub) btn("Re-download", "refresh", () => modelAction("redownload", m.name));
@@ -1427,6 +1517,18 @@ function init() {
   };
   bind("#box-thr", 0.35, (v) => (+v).toFixed(2));
   bind("#text-thr", 0.25, (v) => (+v).toFixed(2));
+  // masks are made for the boxes above the thresholds: new thresholds need a (cheap, same-image) rerun
+  for (const id of ["#box-thr", "#text-thr"]) {
+    $(id).addEventListener("change", () => {
+      const r = S.result, want = [+$("#box-thr").value, +$("#text-thr").value];
+      if (masksActive() && r && !S.cam && !S.live && (!r.masks_for || r.masks_for.join() !== want.join())) detect();
+    });
+  }
+  $("#masks-on").addEventListener("change", (e) => setMasks(e.target.checked ? $("#masks-model").value : null));
+  $("#masks-model").addEventListener("change", (e) => {
+    store.set("masks-model", e.target.value);
+    if ($("#masks-on").checked) setMasks(e.target.value);
+  });
   bind("#line-w", 2.5);
   bind("#label-size", 13);
   for (const id of ["#show-scores", "#fill-boxes", "#mirror-cam", "#nms"]) {

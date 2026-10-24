@@ -22,7 +22,7 @@ echo "copied the source to $BOARD:$REMOTE"
 if ((models)); then
   MODELS="$(ssh "$BOARD" "cd '$REMOTE' && source webapp/models_dir.sh && dino_models_dir '$REMOTE'")"
   ssh "$BOARD" "mkdir -p '$MODELS'"
-  for b in "$ROOT"/build/bundles/dino-*; do
+  for b in "$ROOT"/build/bundles/dino-* "$ROOT"/build/bundles/esam-*; do
     rsync -a --delete "$b" "$BOARD:$MODELS/"
     echo "copied $(basename "$b") to $MODELS"
   done

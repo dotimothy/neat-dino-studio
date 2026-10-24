@@ -82,6 +82,7 @@
             <div class="metric-item part" id="mp-backbone" title="Swin-B image backbone"><i class="part-dot pd-backbone"></i><span class="metric-value">—</span><span class="metric-label">Backbone</span></div>
             <div class="metric-item part" id="mp-encoder" title="Six encoder layers: MLA plus deformable sampling on the CPU"><i class="part-dot pd-encoder"></i><span class="metric-value">—</span><span class="metric-label">Encoder</span></div>
             <div class="metric-item part" id="mp-decoder" title="Top-900 selection and six decoder layers"><i class="part-dot pd-decoder"></i><span class="metric-value">—</span><span class="metric-label">Decoder</span></div>
+            <div class="metric-item part" id="mp-masks" hidden title="EfficientSAM masks: its encoder runs on the MLA alongside the detector, then one decoder pass for the boxes"><i class="part-dot pd-masks"></i><span class="metric-value">—</span><span class="metric-label">Masks</span></div>
             <div class="metric-item part" id="mp-other" title="Image decode, transfers and post-processing"><i class="part-dot pd-other"></i><span class="metric-value">—</span><span class="metric-label">Other</span></div>
           </div>
         </div>
@@ -157,6 +158,11 @@
         <label class="slider"><span>Phrase Score</span><input type="range" id="text-thr" min="0.05" max="0.95" step="0.01" value="0.25"><output id="text-thr-v">0.25</output></label>
         <label class="check"><input type="checkbox" id="nms"> <span>Merge Overlapping Boxes (NMS)</span></label>
         <label class="check"><input type="checkbox" id="show-scores" checked> <span>Show Scores On Boxes</span></label>
+        <div class="mask-row" id="mask-row" hidden>
+          <label class="check" title="EfficientSAM turns each box above the thresholds into a mask (up to 16 per image)"><input type="checkbox" id="masks-on"> <span>Show Masks</span></label>
+          <select id="masks-model" class="mini-select" title="Mask model"></select>
+        </div>
+        <div class="muted small mask-note" id="masks-note" hidden></div>
       </section>
 
       <section class="card results-card" data-card="detections">
@@ -187,7 +193,8 @@
         <h3>Models</h3>
         <p class="muted">One detector runs on the MLA at a time. A detector needs the text encoder too; downloads include it.
           Fast (576 px) suits the webcam; Accurate (768 px) finds smaller things. Tiny is the smaller Grounding DINO
-          (Swin-T backbone, 172.2 M parameters): quicker, a little less accurate.</p>
+          (Swin-T backbone, 172.2 M parameters): quicker, a little less accurate. EfficientSAM (Ti or S) loads next to a
+          Grounding DINO detector and turns its boxes into masks (Show Masks, under Thresholds).</p>
         <div class="storage" id="storage"></div>
         <div class="model-list" id="model-list"></div>
         <div class="hub-line" id="hub-line"></div>

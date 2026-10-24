@@ -41,6 +41,8 @@ Type or say what to find — <code>person . red car . dog with a frisbee .</code
   Grounding DINO Base. Grounding DINO **Tiny** (576 px) is also supported: a bit quicker and a smaller bundle. All bf16.
 - **SAM 3, with masks.** Meta's [SAM 3](https://ai.meta.com/research/sam3/) (Segment Anything with Concepts) runs as a third
   model family: the same prompts, voice and Live mode, and every match gets a mask as well as a box (see below).
+- **Masks for Grounding DINO too (Grounded EfficientSAM).** Turn on *Show Masks* and EfficientSAM (Ti or S) turns each
+  box above the thresholds into a mask, on the MLA next to the detector (see below).
 
 ## Install (Modalix DevKit)
 
@@ -168,8 +170,36 @@ position, box relative-position bias and box head, the mask decoder's prompt att
 update, presence and text scoring, and query · pixel for the masks that are kept.
 
 Build: `.venv-sam3` with transformers 5 (SAM 3's weights are gated: accept the license on Hugging Face first), then
-`model/sam3_export.py --size 672`, `compile/build_sam3.sh 672`, `tools/make_sam3_bundle.py --size 672`, and
+`model/sam3_export.py --size 672`, `compile/build_programs.sh sam3_672`, `tools/make_sam3_bundle.py --size 672`, and
 `tools/sam3_e2e.py` to check the board against PyTorch. The SAM 3 bundle is not on Hugging Face yet.
+
+## Grounded EfficientSAM (masks for Grounding DINO)
+
+[EfficientSAM](https://github.com/yformer/EfficientSAM) (Apache-2.0) in two sizes, Ti (10.2 M parameters) and S
+(26.4 M), compiled at 768 px in bf16. It loads next to a Grounding DINO detector (Settings → Models, or *Show Masks*
+under Thresholds) and makes masks for up to 16 boxes per image: the ones above the Box and Phrase Score thresholds.
+Its image encoder starts as soon as an image arrives, while the detector runs; a prompt change reuses it.
+
+| On a Modalix DevKit, 768 px | Ti | S |
+|---|---|---|
+| Image encoder (once per image) | 46 ms | 98 ms |
+| Mask decoder: 1 / 4 / 8 / 16 boxes | 4 / 14 / 16 / 32 ms | the same |
+| vs PyTorch (FP32), 44 Grounding DINO boxes | mask IoU mean 0.984, median 0.995 | mean 0.990, median 0.996 |
+| Added per image in the studio (Base 576, 11–13 boxes) | ~120 ms | ~170 ms (estimated from the encoder) |
+
+768 px instead of EfficientSAM's 1024: per-layer cost is about half, and the masks agree with the 1024-px ones at a
+median IoU of 0.94 (Ti) / 0.96 (S); 512 px drops to 0.90 / 0.92.
+
+Four ELFs per size (`runtime/src/esam_rt.cpp` runs them): the ViT with the patch embedding (ImageNet normalisation
+folded in) and the neck's 1×1 conv; the neck's 3×3 conv on the same bytes in image order; and the mask decoder for
+1 box and for 8 boxes (boxes on the H axis; the runtime times both at load and covers n boxes with the cheapest mix).
+The decoder's 2×2 transposed convs are 1×1 convs to sub-pixel channels and its per-box GroupNorm one row slice per box;
+the CPU does the patching, the box corners' Fourier embedding, the best-of-3 pick by predicted IoU, and a 2× bilinear
+upsample (masks are 384×384 over the image, stretched like the encoder's input).
+
+Build: `model/esam_export.py --variant ti` (weights from the EfficientSAM repo in `build/weights/efficientsam/`),
+`compile/build_programs.sh esam_ti768`, `tools/make_esam_bundle.py --variant ti`, and `tools/esam_e2e.py` to check the
+board against PyTorch. The code in `third_party/efficient_sam/` is upstream's (Apache-2.0).
 
 ## License
 
@@ -177,4 +207,5 @@ Apache-2.0. Grounding DINO © IDEA Research (Apache-2.0); BERT and Swin weights 
 with it. Inter and JetBrains Mono fonts under the SIL Open Font License. The voice models
 (Whisper, Gemma, LFM) are not part of this repository; they are installed separately under
 their own licenses. SAM 3's weights are under Meta's SAM License (https://github.com/facebookresearch/sam3/blob/main/LICENSE),
-not Apache-2.0; a SAM 3 bundle carries a copy of it.
+not Apache-2.0; a SAM 3 bundle carries a copy of it. EfficientSAM (code in `third_party/efficient_sam/` and weights)
+© Meta / the EfficientSAM authors, Apache-2.0.
