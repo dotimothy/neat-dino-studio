@@ -82,6 +82,10 @@ def variant_of(name: str, manifest: dict | None = None) -> str:
 PREC_LABEL = {"bf16": "bf16", "w8a16": "int8 weights"}
 
 
+ESAM = {"ti": {"key": "ti", "name": "Ti", "params": "10.2 M"}, "s": {"key": "s", "name": "S", "params": "26.4 M"}}
+MAX_MASKS = 16          # masks per frame (the highest-scoring boxes above the thresholds)
+
+
 def model_info(name: str | None, manifest: dict | None = None) -> dict | None:
     """What exactly a model is, for the page: names, sizes, how it runs."""
     if not name:
@@ -92,6 +96,17 @@ def model_info(name: str | None, manifest: dict | None = None) -> dict | None:
         g = re.search(r"-(\d{3})-", name)
         size = int(g.group(1)) if g else None
     prec = m.get("precision") or (name.rsplit("-", 1)[-1] if "-" in name else "bf16")
+    if m.get("kind") == "esam" or name.startswith("esam"):
+        v = ESAM.get(str(m.get("variant", "")).rsplit("-", 1)[-1], ESAM["ti"])     # manifest: efficientsam-ti
+        g = re.search(r"esam-(ti|s)(\d{3})", name)
+        if g:
+            v, size = ESAM[g.group(1)], size or int(g.group(2))
+        n = len(m.get("programs", []))
+        return {"name": name, "kind": "esam", "size": size, "precision": prec, "upstream": "yformer/EfficientSAM",
+                "variant": v["key"], "title": f"EfficientSAM {v['name']} · Masks · {size} px · {prec}",
+                "short": f"ESAM {v['name']}",
+                "details": f"yformer/EfficientSAM · EfficientSAM-{v['name']}, {v['params']} parameters (ViT-{v['name']}) · "
+                           f"{size}×{size} input · {prec} · masks for the detector's boxes" + (f" · {n} ELFs" if n else "")}
     if m.get("kind") == "sam3" or name.startswith("sam3"):
         n = len(m.get("programs", []))
         return {"name": name, "kind": "sam3", "size": size, "precision": prec, "upstream": "facebook/sam3",
@@ -182,7 +197,7 @@ def read_bundle(d: Path) -> dict | None:
         m = json.loads((d / "manifest.json").read_text())
     except (OSError, ValueError):
         return None
-    if m.get("kind") not in ("detector", "text", "sam3"):
+    if m.get("kind") not in ("detector", "text", "sam3", "esam"):
         return None
     return m
 
@@ -256,7 +271,7 @@ class Hub:
                 if not (self.NAME.fullmatch(name) and re.fullmatch(r"[a-z0-9][a-z0-9_.-]{0,48}", e["path"])
                         and len(files) == 1 and self.FILE.fullmatch(files[0]["name"])
                         and isinstance(files[0]["bytes"], int) and re.fullmatch(r"[0-9a-f]{64}", files[0]["sha256"])
-                        and e.get("kind") in ("detector", "text", "sam3")):
+                        and e.get("kind") in ("detector", "text", "sam3", "esam")):
                     raise ValueError(f"the entry for {name!r} is not one this app understands")
                 models[name] = e
             self._models, self._error = models, None
@@ -433,6 +448,11 @@ class Studio:
         self.prefs_path = self.models_dir / ".studio.json"
         self.events: list[dict] = []
         self._verified: dict[str, tuple] = {}
+        # Masks for the detector's boxes (EfficientSAM, its own MLA runtime next to the detector)
+        self.masker: backends.EsamBackend | None = None
+        self.mask_model: str | None = None
+        self.mask_state = "off"           # off | loading | ready | error
+        self.mask_error: str | None = None
 
     # ---- catalog
     def catalog(self) -> dict:
@@ -461,7 +481,10 @@ class Studio:
                 "state": state, "bytes": bundle_bytes(self.models_dir / n) if m else (e or {}).get("files", [{}])[0].get("bytes"),
                 "download_bytes": (e or {}).get("files", [{}])[0].get("bytes") if e else None,
                 "partial_bytes": self.hub.partial_bytes(n) if e else 0,
-                "loaded": n == self.model and self.state in ("ready", "loading"),
+                "loaded": (n == self.mask_model and self.mask_state in ("ready", "loading")) if kind == "esam"
+                else n == self.model and self.state in ("ready", "loading"),
+                "loading": (n == self.mask_model and self.mask_state == "loading") if kind == "esam"
+                else n == self.model and self.state == "loading",
                 "verified": mark[1] if mark else None, "verify_note": mark[2] if mark else None,
                 "progress": job if job and job["name"] == n else None, "error": self.hub.failed(n),
                 "on_hub": e is not None,
@@ -508,7 +531,64 @@ class Studio:
                 "load_seconds": self.load_seconds, "last_ms": self.last_ms,
                 "https": bool(getattr(self.args, "tls", False)), "port": self.args.port,
                 "assist": self.assist.describe(), "max_tokens": 64,
-                "pipeline": getattr(b, "slots", 1) if b else 1, "voice": self.voice.status()}
+                "pipeline": getattr(b, "slots", 1) if b else 1, "voice": self.voice.status(),
+                "masks": self.masks_status()}
+
+    # ---- masks (EfficientSAM)
+    def masks_status(self) -> dict:
+        local = local_bundles(self.models_dir)
+        choices = [{"name": n, "short": model_info(n, m)["short"], "title": model_info(n, m)["title"]}
+                   for n, m in sorted(local.items(), key=lambda x: ("-s" in x[0], x[0])) if m.get("kind") == "esam"]
+        if self.args.backend == "fake":
+            choices = choices or [{"name": "esam-ti768-bf16", "short": "ESAM Ti", "title": "EfficientSAM Ti (fake)"}]
+        mk = self.masker
+        return {"model": self.mask_model, "state": self.mask_state, "error": self.mask_error, "choices": choices,
+                "mask_size": mk.mask_size if mk else None, "max": MAX_MASKS,
+                "info": model_info(self.mask_model, local.get(self.mask_model, {})) if self.mask_model else None}
+
+    def set_masks(self, name: str | None, who: str = "") -> None:
+        """Load EfficientSAM `name` for masks (replacing the current one), or None to turn masks off."""
+        if name and self.args.backend != "fake":
+            m = local_bundles(self.models_dir).get(name)
+            if m is None or m.get("kind") != "esam":
+                raise StudioError(f"{name} is not a mask model on this board")
+        with self.lock:
+            if self.mask_state == "loading":
+                raise StudioError("The mask model is still loading")
+            if name == self.mask_model and self.mask_state == "ready":
+                return
+            old, self.masker = self.masker, None
+            self.mask_model, self.mask_error = name, None
+            self.mask_state = "loading" if name else "off"
+            self._record(f"masks on ({name})" if name else "masks off", who)
+        self._save_prefs(masks=name)
+        threading.Thread(target=self._masks_load, args=(old, name), name="masks-load", daemon=True).start()
+
+    def _masks_load(self, old, name) -> None:
+        try:
+            if old is not None:
+                old.close()
+            if not name:
+                return
+            if self.args.backend == "fake":
+                b = backends.FakeEsamBackend()
+            elif self.args.backend != "mla":
+                raise StudioError("masks need the board (esam_rt)")
+            else:
+                with self.mla_load_lock:
+                    b = backends.EsamBackend(Path(self.args.runtime).with_name("esam_rt"), self.models_dir / name,
+                                             log=lambda s: log(f"  esam_rt: {s}"))
+            with self.lock:
+                if self.mask_model == name:
+                    self.masker, self.mask_state = b, "ready"
+                    log(f"masks ready: {name}")
+                    return
+            b.close()
+        except Exception as e:  # noqa: BLE001
+            with self.lock:
+                if self.mask_model == name:
+                    self.mask_state, self.mask_error = "error", f"Loading {name} failed: {e}"
+            log(f"masks: loading {name} failed: {e}")
 
     # ---- preferences that survive a restart (voice on/off)
     def prefs(self) -> dict:
@@ -650,7 +730,8 @@ class Studio:
 
     def delete(self, name: str, who: str = "") -> None:
         with self.lock:
-            if name == self.model and self.state in ("ready", "loading"):
+            if (name == self.model and self.state in ("ready", "loading")) or \
+                    (name == self.mask_model and self.mask_state in ("ready", "loading")):
                 raise StudioError(f"{name} is loaded; unload it first")
             d = self.models_dir / name
             if not (d / "manifest.json").is_file():
@@ -749,20 +830,34 @@ class Studio:
                 "truncated": False, "tokens": len(phrases), "detections": dets[:300], "timing": timing,
                 "same_image": same, "mask_size": b.mask_size}
 
-    def detect(self, image_bytes: bytes | None, text: str, image_id: str | None, nms: float | None) -> dict:
+    def detect(self, image_bytes: bytes | None, text: str, image_id: str | None, nms: float | None,
+               masks: tuple[float, float] | None = None) -> dict:
         """One detection. Decoding and post-processing run outside the lock, and the runtime
-        takes the next frame while this one is still running, so Live mode keeps two in flight."""
+        takes the next frame while this one is still running, so Live mode keeps two in flight.
+        masks = (box score, phrase score) thresholds: EfficientSAM masks for the boxes above them."""
         if getattr(self.backend, "kind", "") == "sam3" and self.state == "ready":
             return self.detect_sam3(image_bytes, text, image_id, nms)
         t0 = time.time()
         same = image_bytes is None
         dec_ms = 0.0
         rgb = lb = None
+        mk = self.masker if masks and self.mask_state == "ready" else None
+        job = None
         if not same:
             b = self.backend
             if b is not None and self.state == "ready":
-                rgb, lb = self._letterbox(image_bytes, b.size)
+                rgb, lb, img = self._letterbox(image_bytes, b.size, keep=mk is not None)
                 dec_ms = (time.time() - t0) * 1e3
+                if mk is not None:      # the mask encoder runs while the detector does
+                    sq = np.asarray(img.resize((mk.size, mk.size), Image.BILINEAR), np.uint8)
+                    job = mk.start(sq, hashlib.sha1(image_bytes).hexdigest()[:16])
+        try:
+            return self._detect(image_bytes, text, image_id, nms, masks, t0, same, dec_ms, rgb, lb, mk, job)
+        finally:
+            if job is not None:
+                job.boxes(None)
+
+    def _detect(self, image_bytes, text, image_id, nms, masks, t0, same, dec_ms, rgb, lb, mk, job) -> dict:
         with self.lock:
             if self.backend is None or self.state != "ready":
                 raise StudioError("No model is loaded. Open Settings → Models to load one.")
@@ -780,41 +875,77 @@ class Studio:
             else:
                 if rgb is None or rgb.shape[0] != b.size:          # model changed meanwhile
                     t_dec = time.time()
-                    rgb, lb = self._letterbox(image_bytes, b.size)
+                    rgb, lb, _ = self._letterbox(image_bytes, b.size)
                     dec_ms = (time.time() - t_dec) * 1e3
                 fut = b.detect_async(rgb, lb.new_w, lb.new_h)
                 self.last_image = hashlib.sha1(image_bytes).hexdigest()[:16]
                 self._last_lb = lb
             model, image_ref = self.model, self.last_image
+            if mk is not None and job is None:                 # prompt change: the masker reuses its image
+                job = mk.start(None, image_ref)
         det = fut.result()
         cands = postprocess.candidates(det.logits, det.boxes, pr, lb, floor=0.05, nms_iou=nms)
+        t_det = time.time()
+        extra, mtime = {}, {}
+        if job is not None:
+            extra, mtime = self._masks_for(mk, job, cands, masks, lb.width, lb.height)
         total = (time.time() - t0) * 1e3
         self.last_ms = round(total, 1)
         timing = {k: round(v, 1) for k, v in det.timing.items() if v and k != "slot"}
         timing["text"] = round(text_ms, 1)
         if not same:
             timing["decode"] = round(dec_ms, 1)
-        timing["postprocess"] = round((time.time() - t0) * 1e3 - sum(
+        timing["postprocess"] = round((t_det - t0) * 1e3 - sum(
             v for k, v in timing.items() if k in ("total", "text", "decode")), 1)
+        timing.update(mtime)
         timing["server_total"] = round(total, 1)
         return {"model": model, "size": b.size, "image_id": image_ref,
                 "width": lb.width, "height": lb.height, "caption": pr.caption,
                 "phrases": [{"text": p, "color": PALETTE[i % len(PALETTE)]} for i, p in enumerate(pr.phrases)],
                 "truncated": pr.truncated, "tokens": pr.n_tokens, "detections": cands, "timing": timing,
-                "same_image": same}
+                "same_image": same, **extra}
 
-    @staticmethod
-    def _letterbox(data: bytes, size: int) -> tuple[np.ndarray, Letterbox]:
+    def _masks_for(self, mk, job, cands, thr, W, H) -> tuple[dict, dict]:
+        """EfficientSAM masks for the best boxes above the thresholds; adds 'mask' to those detections."""
+        import base64
+        bt, tt = thr
+        sel = [d for d in cands if d["score"] >= bt and d["phrase"] >= 0 and d["phrase_scores"][d["phrase"]] >= tt]
+        sel = sel[:MAX_MASKS]
+        S_ = mk.size
+        boxes = np.array([[x0 * S_ / W, y0 * S_ / H, x1 * S_ / W, y1 * S_ / H] for x0, y0, x1, y1 in
+                          (d["box"] for d in sel)], np.float32).reshape(-1, 4)
+        job.boxes(boxes)
+        try:
+            res = job.result.result(timeout=60)
+        except Exception as e:  # noqa: BLE001
+            log(f"masks failed: {e}")
+            return {"mask_error": str(e)}, {}
+        tm = {}
+        enc = job.encode_ms
+        if enc:
+            tm["masks_encoder"] = round(enc.get("encoder", 0) + enc.get("neck", 0), 1)
+            tm["masks_cpu"] = round(enc.get("patchify", 0), 1)
+        if res is not None:
+            m, iou, t = res
+            for d, mm, sc in zip(sel, m, iou):
+                d["mask"] = base64.b64encode(np.packbits(mm.ravel())).decode()
+                d["mask_score"] = round(float(sc), 3)
+            tm["masks_decoder"] = round(t.get("decoder", 0), 1)
+            tm["masks_cpu"] = round(tm.get("masks_cpu", 0) + t.get("masks_cpu", 0), 1)
+        return {"mask_size": mk.mask_size, "masks_for": [bt, tt]}, tm
+
+    def _letterbox(self, data: bytes, size: int, keep: bool = False) -> tuple[np.ndarray, Letterbox, Image.Image]:
         img = Image.open(io.BytesIO(data))
         if img.format == "JPEG":
-            img.draft("RGB", (size, size))                # decode at 1/2..1/8 scale when big
+            big = max(size, self.masker.size if keep and self.masker else 0)
+            img.draft("RGB", (big, big))                  # decode at 1/2..1/8 scale when big
         img = ImageOps.exif_transpose(img).convert("RGB")
         w, h = img.size
         s = size / max(w, h)
         nw, nh = max(1, round(w * s)), max(1, round(h * s))
         sq = np.zeros((size, size, 3), np.uint8)
         sq[:nh, :nw] = np.asarray(img.resize((nw, nh), Image.BILINEAR))
-        return sq, Letterbox(size, s, w, h, nw, nh)
+        return sq, Letterbox(size, s, w, h, nw, nh), img
 
     def reset_mla(self, who: str = "") -> str:
         """The explicit 'Reset MLA' button: unload, then the DevKit's recovery ladder."""
@@ -842,6 +973,9 @@ class Studio:
     def close(self) -> None:
         self.voice.close()
         with self.lock:
+            if self.masker is not None:
+                self.masker.close()
+                self.masker = None
             if self.backend is not None:
                 self.backend.close()
                 self.backend = None
@@ -942,6 +1076,15 @@ def create_app(studio: Studio) -> Flask:
             return err(e, 409)
         return jsonify({"ok": True, "voice": studio.voice.status()})
 
+    @app.post("/api/masks")
+    def api_masks():
+        name = (request.get_json(silent=True) or {}).get("model") or None
+        try:
+            studio.set_masks(name, who())
+        except StudioError as e:
+            return err(e)
+        return jsonify(studio.masks_status())
+
     @app.post("/api/detect")
     def api_detect():
         f = request.files.get("image")
@@ -953,7 +1096,10 @@ def create_app(studio: Studio) -> Flask:
             data = f.read() if f else None
             if data is None and image_id is None:
                 raise StudioError("Send an image")
-            return jsonify(studio.detect(data, text, image_id if data is None else None, nms_v))
+            mk = request.form.get("masks")              # "box,phrase" thresholds when masks are on
+            mk_v = tuple(float(x) for x in mk.split(",")[:2]) if mk else None
+            return jsonify(studio.detect(data, text, image_id if data is None else None, nms_v,
+                                         masks=mk_v if mk_v and len(mk_v) == 2 else None))
         except StudioError as e:
             return err(e, 409)
         except (OSError, ValueError) as e:
@@ -1076,6 +1222,11 @@ def main() -> int:
     studio = Studio(args)
     if args.model:
         studio.load(args.model, "startup")
+    if studio.prefs().get("masks"):                 # masks were on when the studio last stopped
+        try:
+            studio.set_masks(studio.prefs()["masks"], "startup")
+        except StudioError as e:
+            log(f"masks: {e}")
     if args.backend == "mla" and (args.voice == "on" or (args.voice == "auto" and studio.prefs().get("voice"))):
         try:
             studio.voice.start(llm=studio.prefs().get("voice_llm"))

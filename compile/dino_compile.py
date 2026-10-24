@@ -165,7 +165,7 @@ def main():
         log(f"  {len(over)} per-node precision overrides from {args.quant_overrides}")
     calib = calibration_set(args.calib, inputs, args.num_calib, args.precision)
     qkw = {"automatic_layout_conversion": True} if args.auto_layout else {}
-    q = net.quantize(calibration_data=calib, quantization_config=cfg, model_name=name, log_level=logging.INFO, **qkw)
+    q = net.quantize(calibration_data=calib, quantization_config=cfg, model_name=name, log_level=logging.DEBUG if os.environ.get("DINO_COMPILE_DEBUG") else logging.INFO, **qkw)
     q.save(model_name=name, output_directory=out)
     log(f"  quantized model saved to {out} ({time.time() - t0:.0f} s)")
 

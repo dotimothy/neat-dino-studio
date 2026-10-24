@@ -237,7 +237,7 @@ kbd { font-family: var(--code-font); font-size: 11px; padding: 1px 6px; border-r
 .metric-item.part.idle .metric-value { color: var(--text-3); }
 .part-dot { width: 7px; height: 7px; border-radius: 50%; flex: none; align-self: center; }
 .pd-text { background: #b36bff; } .pd-backbone { background: #3a86ec; } .pd-encoder { background: #16c8a6; }
-.pd-decoder { background: #f2801d; } .pd-other { background: #7a828d; }
+.pd-decoder { background: #f2801d; } .pd-other { background: #7a828d; } .pd-masks { background: #e0569b; }
 
 /* ---- rail cards */
 .card { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); padding: 14px; box-shadow: var(--shadow-sm); }
@@ -420,3 +420,12 @@ dialog::backdrop { background: rgba(5, 8, 12, .55); backdrop-filter: blur(3px); 
 .btn .spinner { width: 13px; height: 13px; }
 .model .pbar { margin-top: 2px; }
 .det-model { font-size: 12px; color: var(--text-3); margin: -6px 0 8px; }
+
+/* Masks (EfficientSAM) toggle under Thresholds */
+.mask-row { display: flex; align-items: center; gap: 10px; margin-top: 4px; }
+.mask-row .check { margin: 8px 0 2px; flex: 1; }
+.mini-select { height: 28px; border-radius: 8px; border: 1px solid var(--border); background: var(--surface-2); color: var(--text);
+  padding: 0 6px; font-size: 12.5px; }
+.mask-note { margin: 2px 0 0 24px; }
+.mask-note.err { color: var(--err); }
+.mask-note .link { font-size: inherit; }
