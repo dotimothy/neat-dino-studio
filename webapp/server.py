@@ -61,6 +61,112 @@ PALETTE = ["#16c8a6", "#3a86ec", "#f2801d", "#a9c81c", "#e5484d", "#b36bff", "#f
            "#ff40a0", "#4bb54a", "#8f9bff", "#ff8a65"]
 
 
+# --------------------------------------------------------------------------- the MLA on the board
+LEGACY_MLA_SERVICE = "simaai-appcomplex.service"      # firmware before Platform 3.0
+MLA_DEVICES = ("/dev/mla", "/dev/simaai-mlamem")
+MLA_DMABUF_EXPORTER = "simaai,dms"                    # what Platform 3.0 programs hold on the MLA
+PROC = Path("/proc")
+
+
+def legacy_mla_service() -> bool:
+    """Is simaai-appcomplex.service installed? Platform 3.0 retired it: each program holds its
+    own models on the MLA, and they are freed when it exits."""
+    try:
+        r = subprocess.run(["systemctl", "list-unit-files", LEGACY_MLA_SERVICE, "--no-legend"],
+                           capture_output=True, text=True, timeout=10)
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return LEGACY_MLA_SERVICE in r.stdout
+
+
+def mla_users(proc: Path = PROC, exclude: set[int] | frozenset = frozenset()) -> list[dict]:
+    """The programs on the MLA: every process with /dev/mla open or a simaai,dms dma-buf, with
+    the MLA memory it holds ("bytes": its simaai,dms dma-bufs, each once). Only processes this
+    user may inspect are seen."""
+    out = []
+    try:
+        pids = sorted(int(d) for d in os.listdir(proc) if d.isdigit())
+    except OSError:
+        return out
+    for pid in pids:
+        if pid in exclude:
+            continue
+        fd_dir = proc / str(pid) / "fd"
+        try:
+            fds = os.listdir(fd_dir)
+        except OSError:
+            continue
+        on_mla, bufs = False, {}
+        for fd in fds:
+            try:
+                target = os.readlink(fd_dir / fd)
+            except OSError:
+                continue
+            if target in MLA_DEVICES:
+                on_mla = True
+            elif target.startswith("/dmabuf"):
+                try:
+                    info = (proc / str(pid) / "fdinfo" / fd).read_text()
+                except OSError:
+                    continue
+                f = dict(line.split(":", 1) for line in info.splitlines() if ":" in line)
+                if f.get("exp_name", "").strip() == MLA_DMABUF_EXPORTER:
+                    try:
+                        bufs[f.get("ino", "").strip() or fd] = int(f.get("size", "0"))
+                    except ValueError:
+                        pass
+        if on_mla or bufs:
+            try:
+                cmd = (proc / str(pid) / "cmdline").read_bytes().replace(b"\0", b" ").decode("utf-8", "replace").strip()
+            except OSError:
+                cmd = ""
+            out.append({"pid": pid, "cmd": cmd[:200], "bytes": sum(bufs.values())})
+    return out
+
+
+def stop_programs(pids: list[int], grace: float = 60.0) -> tuple[list[int], list[int]]:
+    """SIGTERM each, SIGKILL whatever is left after `grace` seconds (a clean exit is what frees
+    its MLA memory). Returns (stopped, not allowed)."""
+    sent, denied = [], []
+    for pid in pids:
+        try:
+            os.kill(pid, signal.SIGTERM)
+            sent.append(pid)
+        except ProcessLookupError:
+            pass
+        except PermissionError:
+            denied.append(pid)
+
+    def alive(pid: int) -> bool:
+        try:
+            with open(f"/proc/{pid}/stat") as f:
+                return f.read().split(") ", 1)[-1][:1] != "Z"     # a zombie has exited
+        except OSError:
+            return False
+
+    end = time.monotonic() + grace
+    while time.monotonic() < end and any(alive(p) for p in sent):
+        time.sleep(0.2)
+    for pid in sent:
+        if alive(pid):
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except OSError:
+                pass
+    return sent, denied
+
+
+def program_name(command: str) -> str:
+    """What to call a program on the MLA, from its command line."""
+    for mark, name in (("neat-genai-studio", "Neat GenAI Studio"), ("neat-decision-studio", "Neat Decision Studio"),
+                       ("neat-change-studio", "Neat Change Studio"), ("voice_server.py", "a DINO Studio voice server"),
+                       ("webapp/server.py", "another DINO Studio"), ("llima", "LLiMa")):
+        if mark in command:
+            return name
+    words = command.split()
+    return Path(words[0]).name if words else "an unnamed program"
+
+
 class StudioError(Exception):
     pass
 
@@ -1077,7 +1183,12 @@ class Studio:
         return sq, Letterbox(size, s, w, h, nw, nh), img
 
     def reset_mla(self, who: str = "") -> str:
-        """The explicit 'Reset MLA' button: unload, then the DevKit's recovery ladder."""
+        """The explicit 'Reset MLA' button: unload, then free the MLA for everybody.
+
+        Before Platform 3.0 that is the DevKit's recovery ladder (restart the MLA services).
+        From 3.0 there are no such services: each program holds its own models, freed when it
+        exits. So the studio unloads its own (detector, masks, voice) and stops every other
+        program on the MLA: SIGTERM, then SIGKILL after a minute."""
         with self.lock:
             if self.backend is not None:
                 self.backend.close()
@@ -1088,6 +1199,8 @@ class Studio:
                 cmds.append(["sh", "-c", os.environ["DINO_RESET_COMMAND"]])
             if shutil.which("fix_devkit_runtime.sh"):
                 cmds.append(["sudo", "-n", "fix_devkit_runtime.sh"])
+            if not cmds and not legacy_mla_service():
+                return self._reset_mla_3()
             cmds.append(["sudo", "-n", "sh", "-c", "systemctl restart simaai-appcomplex.service && "
                          "( [ -x /usr/bin/init_mla_memory.sh ] && /usr/bin/init_mla_memory.sh || true )"])
             for c in cmds:
@@ -1098,6 +1211,39 @@ class Studio:
                 except (OSError, subprocess.TimeoutExpired):
                     continue
             raise StudioError("Could not reset the MLA (needs passwordless sudo or DINO_RESET_COMMAND)")
+
+    def _reset_mla_3(self) -> str:
+        """Platform 3.0: unload this studio's masks and voice too, then stop the other programs
+        on the MLA. Called with the lock held and the detector already unloaded."""
+        if self.masker is not None:
+            self.masker.close()
+            self.masker = None
+        self.mask_model, self.mask_error, self.mask_state = None, None, "off"
+        self.voice.stop(wait=True)
+        others = mla_users(exclude={os.getpid()})
+        stopped, denied = stop_programs([u["pid"] for u in others])
+        names = ", ".join(sorted({program_name(u["cmd"]) for u in others if u["pid"] in stopped}))
+        if denied:
+            raise StudioError(f"Could not stop {', '.join(map(str, denied))} (another user's program): "
+                              "stop it with sudo kill on the board")
+        if not stopped:
+            return "MLA reset: the studio's models are unloaded and nothing else is on the MLA"
+        return f"MLA reset: the studio's models are unloaded and {len(stopped)} other program(s) stopped ({names})"
+
+    def mla(self) -> dict:
+        """What Reset MLA would do, for its dialog: which firmware path, and who else is on the MLA."""
+        legacy = bool(os.environ.get("DINO_RESET_COMMAND") or shutil.which("fix_devkit_runtime.sh") or legacy_mla_service())
+        others = [] if legacy else mla_users(exclude={os.getpid()} | self._own_pids())
+        for u in others:
+            u["name"] = program_name(u["cmd"])
+        return {"legacy": legacy, "programs": others,
+                "held_bytes": sum(u["bytes"] for u in mla_users())}
+
+    def _own_pids(self) -> set[int]:
+        """The studio's own helper processes on the MLA (the voice sidecar): Reset unloads them
+        rather than counting them as other programs."""
+        p = self.voice.proc
+        return {p.pid} if p is not None and p.poll() is None else set()
 
     def close(self) -> None:
         # the MLA programs first (each stops in well under a second), the voice sidecar last
@@ -1237,6 +1383,10 @@ def create_app(studio: Studio) -> Flask:
         except RuntimeError as e:                       # the runtime failed (dino_rt error)
             log(f"detect failed: {e}")
             return err(e, 500)
+
+    @app.get("/api/mla")
+    def api_mla():
+        return jsonify(studio.mla())
 
     @app.post("/api/reset-mla")
     def api_reset():
