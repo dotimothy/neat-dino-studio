@@ -115,8 +115,9 @@ class VoiceService:
         self.script = Path(__file__).resolve().parents[1] / "voice" / "voice_server.py"
         self._log = log or (lambda s: None)
         self.lock = threading.Lock()          # one start/stop at a time
-        # Held while the sidecar connects and loads: the MLA dispatcher refuses a client that
-        # connects while another one is loading ("Unable to connect to the server from dispatcher").
+        # Held while the sidecar connects and loads: before Platform 3.0 the MLA dispatcher refuses
+        # a client that connects while another one is loading ("Unable to connect to the server
+        # from dispatcher"). Platform 3.0 has no dispatcher; serialising loads is still harmless.
         self.load_lock = load_lock or threading.Lock()
         self.proc: subprocess.Popen | None = None
         self.state = "off"                    # off | loading | ready | stopping | error

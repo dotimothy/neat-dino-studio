@@ -1568,7 +1568,18 @@ function init() {
   $("#model-rescan").onclick = () => refreshModels();
   $("#hub-refresh").onclick = () => refreshModels();
   $("#reset-mla").onclick = async () => {
-    if (!(await confirmBox("Reset the MLA? This unloads the model for everyone using the studio.", "Reset"))) return;
+    let m = { legacy: true, programs: [] };
+    try { m = await api("/api/mla"); } catch (e) { /* ask with the general text */ }
+    const others = m.programs || [];
+    const text = m.legacy
+      ? "Reset the MLA? This unloads the model for everyone using the studio and restarts the board's MLA services."
+      : "Reset the MLA? This unloads the studio's detector, masks and voice"
+        + (others.length
+          ? `, and stops ${others.length} other program${others.length === 1 ? "" : "s"} on the MLA (each holds its own models on Platform 3.0): `
+            + others.map((u) => `${u.name} (pid ${u.pid}${u.bytes ? ", " + fmtBytes(u.bytes) : ""})`).join(", ")
+            + ". Each gets up to a minute to exit, then it is killed."
+          : ". Nothing else is on the MLA.");
+    if (!(await confirmBox(text, others.length ? "Stop and Reset" : "Reset"))) return;
     try {
       const r = await post("/api/reset-mla");
       toast(r.message);

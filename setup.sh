@@ -70,11 +70,24 @@ fi
 "$PY" -c "import tokenizers" 2>/dev/null && ok "tokenizers (fast)" || ok "tokenizer: built-in WordPiece"
 
 step "Runtime (dino_rt)"
+# What the runtime is built against: the SimaLMM package and the board's platform build. A
+# runtime built on other firmware (before Platform 3.0, say) can still find its libraries and
+# then crash in them (malloc(): invalid size), so a change means a clean rebuild.
+platform_stamp="sima-lmm-dev $(dpkg-query -W -f='${Version}' sima-lmm-dev 2>/dev/null || echo unknown); $(grep -h '^SIMA_BUILD_VERSION' /etc/buildinfo 2>/dev/null || echo unknown)"
+built_for="$(cat "$ROOT/runtime/build/.built-for" 2>/dev/null || true)"
 if ((check)); then
   [[ -x "$ROOT/runtime/build/dino_rt" ]] && ok "runtime/build/dino_rt" || { bad "runtime not built"; fail=1; }
+  if [[ -x "$ROOT/runtime/build/dino_rt" && "$built_for" != "$platform_stamp" ]]; then
+    bad "runtime built for ${built_for:-an unrecorded platform}, the board has ${platform_stamp}: rerun ./setup.sh to rebuild it"; fail=1
+  fi
 else
+  if [[ -d "$ROOT/runtime/build" && "$built_for" != "$platform_stamp" ]]; then
+    warn "runtime built for ${built_for:-an unrecorded platform}: rebuilding it from scratch for ${platform_stamp}"
+    rm -rf "$ROOT/runtime/build.old" && mv "$ROOT/runtime/build" "$ROOT/runtime/build.old"
+  fi
   if cmake -S "$ROOT/runtime" -B "$ROOT/runtime/build" -DCMAKE_BUILD_TYPE=Release > "$ROOT/runtime/build.log" 2>&1 &&
      cmake --build "$ROOT/runtime/build" -j8 >> "$ROOT/runtime/build.log" 2>&1; then
+    echo "$platform_stamp" > "$ROOT/runtime/build/.built-for"
     ok "built runtime/build/dino_rt"
   else
     bad "build failed: see runtime/build.log"; fail=1
